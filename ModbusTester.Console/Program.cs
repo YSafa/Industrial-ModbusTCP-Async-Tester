@@ -1,9 +1,8 @@
 ﻿using System;
 using System.Threading;
 using System.Threading.Tasks;
-using ModbusTester.Core;
 using ModbusTester.Core.Core;
-using ModbusTester.Core.Exceptions; // Namespace kontrolünü doğrula
+using ModbusTester.Core.Exceptions;
 
 // ---------------------------------------------------------
 // SABİT PARAMETRELER (Yerel test için hardcoded)
@@ -12,10 +11,11 @@ const string TargetIp        = "127.0.0.1";
 const int    TargetPort      = 502;
 const byte   SlaveId         = 1;
 const ushort StartAddress    = 0;
-const ushort Quantity        = 135; 
+const ushort Quantity        = 135;
 const int    PollingIntervalMs = 500;
 const int    ReconnectMaxAttempts = 5;
 const int    ReconnectDelayMs     = 2000;
+const int    HeartbeatCycleInterval = 100;
 
 // ---------------------------------------------------------
 // GRACEFUL SHUTDOWN: Ctrl+C sinyalini yakalayıp CancellationToken'a bağlıyoruz.
@@ -59,6 +59,9 @@ catch (ModbusTimeoutException ex)
 using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(PollingIntervalMs));
 long cycleCounter = 0;
 
+// Değişim takibi için önceki okumayı saklayan referans; null-safe olarak tanımlandı.
+ushort[]? oldValues = null;
+
 try
 {
     while (await timer.WaitForNextTickAsync(cts.Token))
@@ -68,8 +71,25 @@ try
         try
         {
             ushort[] registers = await client.ReadHoldingRegistersAsync(SlaveId, StartAddress, Quantity);
-            string values = string.Join(", ", registers);
-            Log($"[Cycle #{cycleCounter}] Okuma başarılı -> [{values}]", ConsoleColor.Green);
+
+            // Span tabanlı karşılaştırma: byte-level SIMD hızlandırmalı, allocation'sız ve çok hızlı.
+            // oldValues null ise (ilk okuma) veya dizi içerik olarak değiştiyse "değişti" sayılır.
+            bool hasChanged = oldValues == null ||
+                              !MemoryExtensions.SequenceEqual<ushort>(oldValues.AsSpan(), registers.AsSpan());
+
+            if (hasChanged)
+            {
+                oldValues = registers;
+
+                string values = string.Join(", ", registers);
+                Log($"[DATA CHANGED - Cycle #{cycleCounter}] -> [{values}]", ConsoleColor.Green);
+            }
+            else if (cycleCounter % HeartbeatCycleInterval == 0)
+            {
+                // Veri değişmese bile driver'ın donmadığını kanıtlamak için periyodik nabız sinyali.
+                Log($"[HEARTBEAT - Cycle #{cycleCounter}] Driver alive, data stream stable.", ConsoleColor.DarkGray);
+            }
+            // Veri değişmedi ve heartbeat turu değilse: tamamen sessiz kal (CPU/IO tasarrufu).
         }
         catch (ModbusProtocolException ex)
         {
@@ -78,6 +98,10 @@ try
         catch (ModbusTimeoutException ex)
         {
             Log($"ZAMAN AŞIMI: {ex.Message}", ConsoleColor.Red);
+
+            // Bağlantı koptuğu için önceki veri hafızası artık geçersiz; sıfırlıyoruz ki
+            // yeniden bağlanınca ilk gelen veri doğru şekilde "değişti" sayılıp loglansın.
+            oldValues = null;
 
             bool reconnected = await TryReconnectAsync();
             if (!reconnected)
@@ -90,10 +114,12 @@ try
         {
             Log($"BAĞLANTI HATASI: {ex.Message}", ConsoleColor.Red);
 
+            oldValues = null;
+
             bool reconnected = await TryReconnectAsync();
             if (!reconnected)
             {
-                Log("Yeniden bağlanma denemeleri tükendi, application kapatılıyor.", ConsoleColor.Red);
+                Log("Yeniden bağlanma denemeleri tükendi, uygulama kapatılıyor.", ConsoleColor.Red);
                 break;
             }
         }
@@ -110,7 +136,8 @@ finally
 }
 
 // ---------------------------------------------------------
-// YARDIMCI YEREL METOTLAR (Static kaldırıldı, sabitlere doğrudan erişebilir)
+// YARDIMCI YEREL METOTLAR (Non-static: dış kapsamdaki const/local değişkenleri
+// closure ile yakalayabilmek için CS8421 hatasından kaçınmak amacıyla static değildir)
 // ---------------------------------------------------------
 
 async Task<bool> TryReconnectAsync()
