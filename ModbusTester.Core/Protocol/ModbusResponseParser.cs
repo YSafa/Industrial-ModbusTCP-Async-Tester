@@ -13,26 +13,55 @@ namespace ModbusTester.Core.Protocol
         // ---------------------------------------------------------
 
         /// <summary>
-        /// FC03 (Read Holding Registers) ve FC04 (Read Input Registers) yanıtlarını çözümler.
+        /// FC03/FC04 yanıtını çözümleyip doğrudan çağıranın verdiği hedef tampona (destination) yazar.
+        /// Artık yeni bir ushort[] tahsis etmez; response de ReadOnlySpan olarak alınır.
         /// </summary>
-        public static ushort[] ParseReadRegistersResponse(byte[] response, ushort expectedTransactionId)
+        public static void ParseReadRegistersResponse(ReadOnlySpan<byte> response, Span<ushort> destination, ushort expectedTransactionId)
         {
             ValidateTransactionId(response, expectedTransactionId);
             ValidateNotException(response);
 
-            // PDU: [7] FunctionCode | [8] ByteCount | [9...] Register verileri (2 byte/register)
             byte byteCount = response[8];
             int registerCount = byteCount / 2;
-            ushort[] registers = new ushort[registerCount];
+
+            // Ek güvenlik: slave'in bildirdiği register sayısı, çağıranın ayırdığı tampon boyutuyla
+            // uyuşmuyorsa (örn. bozuk/beklenmedik bir yanıt), Span sınırlarını aşmadan önce
+            // burada net bir protokol hatası fırlatıyoruz. Bu kontrol öncesinde ModbusClient
+            // tarafında yapılan chunkData.Length karşılaştırmasının artık burada olması, mantığı
+            // tek bir yere topluyor.
+            if (registerCount != destination.Length)
+            {
+                throw new ModbusProtocolException(0x04,
+                    $"Yanıttaki register sayısı beklenenle uyuşmuyor. Beklenen: {destination.Length}, Gelen: {registerCount}.");
+            }
 
             for (int i = 0; i < registerCount; i++)
             {
                 int offset = 9 + (i * 2);
-                // Big-Endian: yüksek byte (MSB) önce, düşük byte (LSB) sonra.
-                registers[i] = (ushort)((response[offset] << 8) | response[offset + 1]);
+                destination[i] = (ushort)((response[offset] << 8) | response[offset + 1]);
             }
+        }
 
-            return registers;
+        private static void ValidateTransactionId(ReadOnlySpan<byte> response, ushort expectedTransactionId)
+        {
+            ushort receivedId = (ushort)((response[0] << 8) | response[1]);
+
+            if (receivedId != expectedTransactionId)
+            {
+                throw new ModbusProtocolException(0,
+                    $"Transaction ID uyuşmuyor. Beklenen: {expectedTransactionId}, Gelen: {receivedId}.");
+            }
+        }
+
+        private static void ValidateNotException(ReadOnlySpan<byte> response)
+        {
+            byte functionCode = response[7];
+
+            if ((functionCode & 0x80) != 0)
+            {
+                byte exceptionCode = response[8];
+                throw new ModbusProtocolException(exceptionCode, $"{exceptionCode:D2} - {GetExceptionDescription(exceptionCode)}");
+            }
         }
 
         /// <summary>

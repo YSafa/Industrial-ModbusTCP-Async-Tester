@@ -91,11 +91,11 @@ namespace ModbusTester.Core.Core
         // OKUMA FONKSİYONLARI (FC01 / FC02 / FC03 / FC04)
         // ---------------------------------------------------------
 
-        public Task<ushort[]> ReadHoldingRegistersAsync(byte slaveId, ushort startAddress, ushort quantity)
-            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadHoldingRegisters, slaveId, startAddress, quantity);
+        public Task ReadHoldingRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination)
+            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadHoldingRegisters, slaveId, startAddress, destination);
 
-        public Task<ushort[]> ReadInputRegistersAsync(byte slaveId, ushort startAddress, ushort quantity)
-            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadInputRegisters, slaveId, startAddress, quantity);
+        public Task ReadInputRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination)
+            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadInputRegisters, slaveId, startAddress, destination);
 
         public Task<bool[]> ReadCoilsAsync(byte slaveId, ushort startAddress, ushort quantity)
             => ReadBitsInternalAsync(ModbusFunctionCode.ReadCoils, slaveId, startAddress, quantity);
@@ -107,57 +107,35 @@ namespace ModbusTester.Core.Core
         // otomatik olarak ardışık parçalara (chunk) bölünüp sırayla okunur ve tek bir dizide birleştirilir.
         private const int MaxRegistersPerRequest = 125;
 
-        private async Task<ushort[]> ReadRegistersInternalAsync(
-            ModbusFunctionCode functionCode, byte slaveId, ushort startAddress, ushort quantity)
+        private async Task ReadRegistersInternalAsync(
+            ModbusFunctionCode functionCode, byte slaveId, ushort startAddress, ushort[] destination)
         {
-            if (quantity == 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(quantity), "Okunacak register sayısı 0 olamaz.");
-            }
+            if (destination == null || destination.Length == 0)
+                throw new ArgumentException("Hedef tampon (destination) boş veya null olamaz.", nameof(destination));
 
-            // Sonuçların birleştirileceği tek hedef dizi; toplam miktar kadar önceden ayrılır.
-            ushort[] destination = new ushort[quantity];
-
-            int remaining = quantity;
+            int remaining = destination.Length;
             int destinationOffset = 0;
 
             while (remaining > 0)
             {
-                // Bu turda okunacak parça boyutu: kalan miktar 125'i aşıyorsa 125, aşmıyorsa kalanın tamamı.
                 int chunkSize = Math.Min(remaining, MaxRegistersPerRequest);
-
-                // Bu parçanın başlangıç adresi: ana başlangıç adresine, şimdiye kadar okunan register sayısı eklenir.
                 ushort chunkStartAddress = (ushort)(startAddress + destinationOffset);
 
                 ushort transactionId = _transactionManager.GetNextTransactionId();
                 byte[] request = ModbusRequestBuilder.BuildReadRequest(
                     functionCode, transactionId, slaveId, chunkStartAddress, (ushort)chunkSize);
 
-                // SendAndReceiveAsync zaten _networkSemaphore ile korunuyor; burada ekstra kilit gerekmiyor.
-                // Herhangi bir chunk hata fırlatırsa (Timeout/Connection), exception olduğu gibi yukarı taşınır
-                // ve şimdiye kadar toplanan kısmi veri hiçbir şekilde döndürülmez (fault isolation).
                 byte[] response = await SendAndReceiveAsync(request);
-                ushort[] chunkData = ModbusResponseParser.ParseReadRegistersResponse(response, transactionId);
 
-                // KESİN DOĞRULAMA: Cihazın eksik veya hatalı boyutta veri dönme ihtimalini sınırda yakala.
-                // Array.Copy'nin örtük ArgumentException'ına güvenmek yerine, burada net bir Modbus seviyesi
-                // hata fırlatıyoruz ki üst katman (MainForm) bunu diğer protokol hataları gibi tutarlı işleyebilsin.
-                if (chunkData.Length != chunkSize)
-                {
-                    throw new ModbusProtocolException(
-                        0x04, // Slave Device Failure (Donanım Hatası kodu)
-                        $"Donanımdan eksik veri paketi geldi. Beklenen: {chunkSize}, Gelen: {chunkData.Length}"
-                    );
-                }
-
-                // Artık bellek sınırlarından %100 emin olarak kopyalayabiliriz.
-                Array.Copy(chunkData, 0, destination, destinationOffset, chunkData.Length);
+                // response.AsSpan() ve destination.AsSpan(...) burada birer LOCAL DEĞİŞKENE
+                // atanmadan, doğrudan tek bir senkron çağrının argümanı olarak üretiliyor; hiçbir
+                // await sınırını geçmedikleri için CS4012'yi tetiklemezler.
+                ModbusResponseParser.ParseReadRegistersResponse(
+                    response, destination.AsSpan(destinationOffset, chunkSize), transactionId);
 
                 destinationOffset += chunkSize;
                 remaining -= chunkSize;
             }
-
-            return destination;
         }
 
         private async Task<bool[]> ReadBitsInternalAsync(

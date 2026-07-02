@@ -69,6 +69,9 @@ using ModbusTester.Core.Exceptions;
     string? lastLoggedError = null;
 
     int lastKnownIntervalMs = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
+    
+    ushort[] readBuffer = new ushort[Math.Max(1, (int)(settings.GetValue<int?>("Quantity") ?? 1))];
+    
     PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromMilliseconds(lastKnownIntervalMs));
 
     try
@@ -133,23 +136,19 @@ using ModbusTester.Core.Exceptions;
 
             try
             {
-                ushort[] registers = await client.ReadHoldingRegistersAsync(liveSlaveId, liveStartAddress, liveQuantity);
-
-                // Başarılı okuma gerçekleşti; eğer sistem daha önce bir hata durumundaysa, bunu
-                // belirgin bir "RECOVERY" mesajıyla bildiriyoruz ve hata hafızasını sıfırlıyoruz.
-                if (lastLoggedError != null)
+                if (readBuffer.Length != liveQuantity)
                 {
-                    Log("[RECOVERY] Driver successfully recovered from previous errors. Data stream is back to normal.", ConsoleColor.Cyan);
-                    lastLoggedError = null;
+                    readBuffer = new ushort[liveQuantity];
+                    oldValues = null;
                 }
 
-                bool layoutChanged = oldValues == null ||
-                                     oldValues.Length != registers.Length ||
-                                     oldStartAddress != liveStartAddress;
+                await client.ReadHoldingRegistersAsync(liveSlaveId, liveStartAddress, readBuffer);
+
+                bool layoutChanged = oldValues == null || oldValues.Length != readBuffer.Length || oldStartAddress != liveStartAddress;
 
                 string? changeLog = layoutChanged
-                    ? BuildFullChangeLog(registers, liveStartAddress)
-                    : BuildDiffChangeLog(oldValues!, registers, liveStartAddress);
+                    ? BuildFullChangeLog(readBuffer, liveStartAddress)
+                    : BuildDiffChangeLog(oldValues!, readBuffer, liveStartAddress);
 
                 if (changeLog != null)
                 {
@@ -160,7 +159,7 @@ using ModbusTester.Core.Exceptions;
                     Log($"[HEARTBEAT - Cycle #{cycleCounter}] Driver alive, data stream stable.", ConsoleColor.DarkGray);
                 }
 
-                oldValues = registers;
+                oldValues = (ushort[])readBuffer.Clone();
                 oldStartAddress = liveStartAddress;
             }
             catch (ModbusProtocolException ex)
@@ -291,7 +290,17 @@ using ModbusTester.Core.Exceptions;
             }
             catch (Exception ex)
             {
-                Log($"Deneme {attempt} başarısız: {ex.Message}", ConsoleColor.DarkYellow);
+                // Kapanış sinyali zaten verildiyse, beklenmedik bir soket hatasının bu genel bloğa
+                // düşüp anlamsız loglar basmasını engelliyoruz; döngü temizce kırılır.
+                if (cts.Token.IsCancellationRequested) break;
+
+                string errorMessage = $"BEKLENMEYEN HATA: {ex.Message}";
+
+                if (lastLoggedError != errorMessage)
+                {
+                    Log(errorMessage, ConsoleColor.Red);
+                    lastLoggedError = errorMessage;
+                }            
             }
         }
 

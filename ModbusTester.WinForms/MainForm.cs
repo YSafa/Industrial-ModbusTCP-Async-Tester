@@ -388,6 +388,15 @@ namespace ModbusTester
     // her tick'te tekrar Invoke ile UI'a gidilmiyor.
     PollingParameters parameters = GetPollingParametersSafe(session);
 
+    bool isRegisterBased = parameters.FunctionCode == ModbusFunctionCode.ReadHoldingRegisters ||
+                           parameters.FunctionCode == ModbusFunctionCode.ReadInputRegisters;
+
+    if (isRegisterBased)
+    {
+        int registerSizePerItem = GetRegisterSizeForDataType(parameters.DataType);
+        session.RegisterReadBuffer = new ushort[parameters.UserQuantity * registerSizePerItem];
+    }
+    
     session.CurrentIntervalMs = Math.Max(50, parameters.IntervalMs);
     session.Timer = new PeriodicTimer(TimeSpan.FromMilliseconds(session.CurrentIntervalMs));
 
@@ -593,25 +602,30 @@ namespace ModbusTester
 
         private async Task ReadAndDisplayRegistersAsync(TabSession session, PollingParameters parameters)
         {
+            if (session.Client == null || session.RegisterReadBuffer == null) return;
+
+            ushort[] destination = session.RegisterReadBuffer;
             int registerSizePerItem = GetRegisterSizeForDataType(parameters.DataType);
-            int totalQuantity = parameters.UserQuantity * registerSizePerItem;
 
-            if (session.Client == null) return;
-
-            ushort[] registers = parameters.FunctionCode == ModbusFunctionCode.ReadHoldingRegisters
-                ? await session.Client.ReadHoldingRegistersAsync(parameters.SlaveId, parameters.StartAddress, (ushort)totalQuantity)
-                : await session.Client.ReadInputRegistersAsync(parameters.SlaveId, parameters.StartAddress, (ushort)totalQuantity);
+            if (parameters.FunctionCode == ModbusFunctionCode.ReadHoldingRegisters)
+                await session.Client.ReadHoldingRegistersAsync(parameters.SlaveId, parameters.StartAddress, destination);
+            else
+                await session.Client.ReadInputRegistersAsync(parameters.SlaveId, parameters.StartAddress, destination);
 
             session.LastProtocolErrorCode = null;
 
-            bool hasChanged = HasValuesChanged(session.OldValues, registers);
+            bool hasChanged = HasValuesChanged(session.OldValues, destination);
             if (hasChanged)
             {
-                session.OldValues = (ushort[])registers.Clone();
+                // Not: destination her tick'te İÇERİDEN üzerine yazıldığı için, karşılaştırma
+                // referansı olarak Clone() ile ayrı bir kopya alınmalı; aksi halde bir sonraki
+                // tick'te destination mutasyona uğradığında OldValues da "sessizce" değişmiş olurdu.
+                session.OldValues = (ushort[])destination.Clone();
+
                 this.Invoke(new Action(() =>
                 {
                     LogMessage(session, "Veri Değişti.", Color.Green);
-                    DisplayRegistersInGrid(session, registers, parameters.DataType, parameters.StartAddress, registerSizePerItem);
+                    DisplayRegistersInGrid(session, destination, parameters.DataType, parameters.StartAddress, registerSizePerItem);
                 }));
             }
         }
@@ -942,6 +956,8 @@ namespace ModbusTester
             public int RenderedRowCount { get; set; }
             public string RenderedDataType { get; set; } = string.Empty;
 
+            public ushort[]? RegisterReadBuffer { get; set; }
+            
             public TabSession(TabPage page) { Page = page; }
         }
     }
