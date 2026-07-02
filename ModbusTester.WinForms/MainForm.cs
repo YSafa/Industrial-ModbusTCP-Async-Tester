@@ -20,6 +20,13 @@ namespace ModbusTester
         // Dinamik sekmelere isim önerisi üretmek için sayaç.
         private int _dynamicTabCounter = 1;
 
+        
+        // FormClosing'in Windows tarafından erken sonlandırılmasını engellemek için kullanılan bayrak.
+        // İki aşamalı kapanma deseninin (Two-Stage Close) çekirdeği: async void event handler'da
+        // await kontrolü bırakır bırakmaz Windows formu yok etmeye devam edebileceği için,
+        // gerçek kapanışa yalnızca temizlik %100 bittiğinde izin veriyoruz.
+        private bool _readyToClose = false;
+        
         // Tüm sekmelerin ortak kullandığı fonksiyon kodu eşleme listesi (Display <-> enum).
         private readonly List<(string Display, ModbusFunctionCode Code)> _functionCodeItems = new()
         {
@@ -284,7 +291,7 @@ namespace ModbusTester
                 session.OldValues = null;
                 session.OldBitValues = null;
 
-                StartPolling(session);
+                await StartPolling(session);
                 session.BtnStop.Enabled = true;
             }
             catch (ModbusConnectionException ex) { LogMessage(session, $"BAĞLANTI HATASI: {ex.Message}", Color.Red); }
@@ -293,18 +300,20 @@ namespace ModbusTester
             finally { session.BtnConnect.Enabled = true; }
         }
 
-        private void BtnStop_Click(TabSession session)
+        private async void BtnStop_Click(TabSession session)
         {
-            StopPolling(session);
+            await StopPolling(session);
+
             session.Client?.Disconnect();
             LogMessage(session, "Bağlantı kesildi, polling durduruldu.", Color.Orange);
             SetConnectionControlsEnabled(session, true);
             session.BtnStop.Enabled = false;
         }
 
-        /// <summary>
-        /// Yalnızca IP, Port ve Slave ID kilitler/açar. Diğer tüm parametreler bağlantı durumundan
-        /// bağımsız olarak her zaman düzenlenebilir kalır (Hot-Reload gereksinimi).
+        //// <summary>
+        /// Bağlantı aktif olduğu sürece TÜM konfigürasyon kontrollerini kilitler.
+        /// Bu sayede arka plan polling döngüsü, parametreleri her tick'te UI thread'inden
+        /// okumak zorunda kalmaz; bağlantı kurulmadan hemen önce tek seferlik bir okuma yeterli olur.
         /// </summary>
         private void SetConnectionControlsEnabled(TabSession session, bool enabled)
         {
@@ -317,126 +326,150 @@ namespace ModbusTester
             session.TxtIp.Enabled = enabled;
             session.TxtPort.Enabled = enabled;
             session.NumSlaveId.Enabled = enabled;
+            session.NumStartAddress.Enabled = enabled;
+            session.NumQuantity.Enabled = enabled;
+            session.CmbFunctionCode.Enabled = enabled;
+            session.CmbDataType.Enabled = enabled;
+            session.NumPollingInterval.Enabled = enabled;
         }
 
         // ---------------------------------------------------------
         // POLLING DÖNGÜSÜ (PeriodicTimer, Hot-Reload destekli)
         // ---------------------------------------------------------
 
-        private void StartPolling(TabSession session)
+        private async Task StartPolling(TabSession session)
         {
-            StopPolling(session);
+            // Önceki görev varsa tamamen sonlanmasını bekleyip TEMİZ bir başlangıç yapıyoruz.
+            await StopPolling(session);
+
             session.PollingCts = new CancellationTokenSource();
             var token = session.PollingCts.Token;
             session.PollingTask = Task.Run(() => PollingLoopAsync(session, token), token);
         }
 
-        private void StopPolling(TabSession session)
+        /// <summary>
+        /// Arka plan polling görevini güvenli şekilde durdurur: önce iptal sinyali gönderir,
+        /// ardından görevin GERÇEKTEN sona ermesini bekler (thread join), ve ancak o zaman
+        /// CancellationTokenSource / PeriodicTimer gibi kaynakları imha eder. Bu sıralama,
+        /// arka plan thread'inin imha edilmiş bir token veya kontrol üzerinde işlem yapmaya
+        /// çalışıp çökmesini (ObjectDisposedException / InvalidOperationException) engeller.
+        /// </summary>
+        private async Task StopPolling(TabSession session)
         {
             session.PollingCts?.Cancel();
+
+            if (session.PollingTask != null && !session.PollingTask.IsCompleted)
+            {
+                try
+                {
+                    // Arka plan görevi kendi içindeki catch(OperationCanceledException) ile
+                    // döngüden çıkıp normal şekilde tamamlanır; yine de bir güvenlik payı olarak yakalıyoruz.
+                    await session.PollingTask;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Beklenen iptal senaryosu; sessizce geçiyoruz.
+                }
+            }
+
+            // Arka plan thread'i artık kesin olarak durdu; kaynakları güvenle imha edebiliriz.
             session.PollingCts?.Dispose();
             session.PollingCts = null;
+            session.PollingTask = null;
+
             session.Timer?.Dispose();
             session.Timer = null;
         }
 
         private async Task PollingLoopAsync(TabSession session, CancellationToken token)
+{
+    // Parametreler bağlantı kurulmadan önce zaten kilitlendiği için, döngüye girmeden hemen
+    // önce SADECE BİR KEZ UI thread'inden okunuyor. Döngü boyunca bu sabit değer kullanılacak;
+    // her tick'te tekrar Invoke ile UI'a gidilmiyor.
+    PollingParameters parameters = GetPollingParametersSafe(session);
+
+    session.CurrentIntervalMs = Math.Max(50, parameters.IntervalMs);
+    session.Timer = new PeriodicTimer(TimeSpan.FromMilliseconds(session.CurrentIntervalMs));
+
+    while (!token.IsCancellationRequested)
+    {
+        try
         {
-            // İlk PeriodicTimer, o anki polling aralığıyla kuruluyor.
-            PollingParameters initial = GetPollingParametersSafe(session);
-            session.CurrentIntervalMs = Math.Max(50, initial.IntervalMs);
-            session.Timer = new PeriodicTimer(TimeSpan.FromMilliseconds(session.CurrentIntervalMs));
-
-            while (!token.IsCancellationRequested)
+            await ReadAndDisplayAsync(session, parameters);
+            session.LastProtocolErrorCode = null;
+            session.LastGeneralErrorMessage = null;
+        }
+        catch (ModbusProtocolException ex)
+        {
+            if (session.LastProtocolErrorCode == null || session.LastProtocolErrorCode.Value != ex.ExceptionCode)
             {
-                PollingParameters parameters = GetPollingParametersSafe(session);
+                LogMessage(session, $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}", Color.Red);
+                session.LastProtocolErrorCode = ex.ExceptionCode;
+            }
+            ClearGridSafe(session);
+        }
+        catch (ModbusTimeoutException ex)
+        {
+            LogMessage(session, $"ZAMAN AŞIMI: {ex.Message}", Color.Red);
+            ClearGridSafe(session);
 
-                try
-                {
-                    await ReadAndDisplayAsync(session, parameters);
-                    session.LastProtocolErrorCode = null;
-                    session.LastGeneralErrorMessage = null;
-                }
-                catch (ModbusProtocolException ex)
-                {
-                    if (session.LastProtocolErrorCode == null || session.LastProtocolErrorCode.Value != ex.ExceptionCode)
-                    {
-                        LogMessage(session, $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}", Color.Red);
-                        session.LastProtocolErrorCode = ex.ExceptionCode;
-                    }
-                    ClearGridSafe(session);
-                }
-                catch (ModbusTimeoutException ex)
-                {
-                    LogMessage(session, $"ZAMAN AŞIMI: {ex.Message}", Color.Red);
-                    ClearGridSafe(session);
-
-                    bool reconnected = await TryReconnectAsync(session, token);
-                    if (!reconnected)
-                    {
-                        SetConnectionControlsEnabled(session, true);
-                        SetConnectionButtonsAfterDrop(session);
-                        break;
-                    }
-
-                    session.LastProtocolErrorCode = null;
-                    session.LastGeneralErrorMessage = null;
-                    session.OldValues = null;
-                    session.OldBitValues = null;
-                    continue;
-                }
-                catch (ModbusConnectionException ex)
-                {
-                    LogMessage(session, $"BAĞLANTI HATASI: {ex.Message}", Color.Red);
-                    ClearGridSafe(session);
-
-                    bool reconnected = await TryReconnectAsync(session, token);
-                    if (!reconnected)
-                    {
-                        SetConnectionControlsEnabled(session, true);
-                        SetConnectionButtonsAfterDrop(session);
-                        break;
-                    }
-
-                    session.LastProtocolErrorCode = null;
-                    session.LastGeneralErrorMessage = null;
-                    session.OldValues = null;
-                    session.OldBitValues = null;
-                    continue;
-                }
-                catch (Exception ex)
-                {
-                    if (session.LastGeneralErrorMessage == null || session.LastGeneralErrorMessage != ex.Message)
-                    {
-                        LogMessage(session, $"HATA: {ex.Message}", Color.Red);
-                        session.LastGeneralErrorMessage = ex.Message;
-                    }
-                    ClearGridSafe(session);
-                }
-
-                // Sorgulama aralığı runtime'da değiştiyse (Hot-Reload), eski timer dispose edilip
-                // yeni süreyle yeniden oluşturuluyor.
-                if (parameters.IntervalMs != session.CurrentIntervalMs && parameters.IntervalMs > 0)
-                {
-                    session.Timer?.Dispose();
-                    session.Timer = new PeriodicTimer(TimeSpan.FromMilliseconds(parameters.IntervalMs));
-                    session.CurrentIntervalMs = parameters.IntervalMs;
-                }
-
-                try
-                {
-                    if (session.Timer == null) break;
-                    if (!await session.Timer.WaitForNextTickAsync(token)) break;
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
+            bool reconnected = await TryReconnectAsync(session, token);
+            if (!reconnected)
+            {
+                SetConnectionControlsEnabled(session, true);
+                SetConnectionButtonsAfterDrop(session);
+                break;
             }
 
-            session.Timer?.Dispose();
-            session.Timer = null;
+            session.LastProtocolErrorCode = null;
+            session.LastGeneralErrorMessage = null;
+            session.OldValues = null;
+            session.OldBitValues = null;
+            continue;
         }
+        catch (ModbusConnectionException ex)
+        {
+            LogMessage(session, $"BAĞLANTI HATASI: {ex.Message}", Color.Red);
+            ClearGridSafe(session);
+
+            bool reconnected = await TryReconnectAsync(session, token);
+            if (!reconnected)
+            {
+                SetConnectionControlsEnabled(session, true);
+                SetConnectionButtonsAfterDrop(session);
+                break;
+            }
+
+            session.LastProtocolErrorCode = null;
+            session.LastGeneralErrorMessage = null;
+            session.OldValues = null;
+            session.OldBitValues = null;
+            continue;
+        }
+        catch (Exception ex)
+        {
+            if (session.LastGeneralErrorMessage == null || session.LastGeneralErrorMessage != ex.Message)
+            {
+                LogMessage(session, $"HATA: {ex.Message}", Color.Red);
+                session.LastGeneralErrorMessage = ex.Message;
+            }
+            ClearGridSafe(session);
+        }
+
+        try
+        {
+            if (session.Timer == null) break;
+            if (!await session.Timer.WaitForNextTickAsync(token)) break;
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+    }
+
+    session.Timer?.Dispose();
+    session.Timer = null;
+}
 
         /// <summary>
         /// Bağlantı koptuğunda maksimum ReconnectMaxAttempts kez yeniden bağlanmayı dener.
@@ -765,9 +798,11 @@ namespace ModbusTester
         // SEKME KAPATMA
         // ---------------------------------------------------------
 
-        private void CloseSession(TabSession session)
+        private async void CloseSession(TabSession session)
         {
-            StopPolling(session);
+            // Arka plan görevi TAMAMEN durana kadar bekliyoruz; page.Dispose() ancak ondan sonra çağrılıyor.
+            await StopPolling(session);
+
             session.Client?.Disconnect();
             session.Client = null;
 
@@ -780,12 +815,40 @@ namespace ModbusTester
         // FORM KAPANIRKEN TÜM SEKMELERİN TEMİZLİĞİ
         // ---------------------------------------------------------
 
-        private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+        private async void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
         {
-            foreach (var session in _sessions)
+            // 1. Aşama: Temizlik zaten tamamlandıysa (bu noktaya biz kendimiz this.Close() ile
+            // ikinci kez geldiysek), formun gerçekten kapanmasına izin ver.
+            if (_readyToClose) return;
+
+            // 2. Aşama: Kapanmayı GEÇİCİ olarak iptal et; Windows'un formu erken yok etmesini engelle.
+            e.Cancel = true;
+
+            // Temizlik sürerken kullanıcının forma müdahale edip yeni state/hata üretmesini önlüyoruz.
+            this.Enabled = false;
+
+            try
             {
-                StopPolling(session);
-                session.Client?.Disconnect();
+                // Tüm sekmelerdeki arka plan polling görevlerinin GERÇEKTEN sona ermesini bekliyoruz;
+                // StopPolling zaten cancel -> await join -> dispose sırasını içeriyor.
+                foreach (var session in _sessions)
+                {
+                    await StopPolling(session);
+                    session.Client?.Disconnect();
+                }
+            }
+            catch (Exception)
+            {
+                // Temizlik sırasında (log/disconnect vb.) oluşabilecek herhangi bir hatayı yutuyoruz;
+                // amaç formun kilitli/yarım kapanmış bir durumda asılı kalmasını kesinlikle önlemek.
+            }
+            finally
+            {
+                // 3. Aşama: Temizlik kesin olarak bitti. Bayrağı kaldır ve formu programatik
+                // olarak tekrar kapat; bu sefer üstteki "if (_readyToClose) return;" devreye girip
+                // gerçek kapanışa izin verecek.
+                _readyToClose = true;
+                this.Close();
             }
         }
 
