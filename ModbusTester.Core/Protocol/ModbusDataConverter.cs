@@ -46,20 +46,14 @@ namespace ModbusTester.Core.Protocol
         ///   inverse=false -> registers[0] YÜKSEK kelime (high word), registers[1] DÜŞÜK kelime (low word)
         ///   inverse=true  -> registers[0] DÜŞÜK kelime, registers[1] YÜKSEK kelime (word swap / CDAB)
         /// </summary>
-        public static float ToFloat(ushort[] registers, bool inverse)
+        public static float ToFloat(ReadOnlySpan<ushort> registers, bool inverse)
         {
             ValidateLength(registers, 2, nameof(ToFloat));
 
-            // inverse durumuna göre hangi register'ın yüksek/düşük kelime olduğunu belirliyoruz.
             ushort highWord = inverse ? registers[1] : registers[0];
             ushort lowWord = inverse ? registers[0] : registers[1];
 
-            // 32-bit'lik birleşik değeri bit kaydırma ile oluşturuyoruz:
-            // Yüksek kelimeyi 16 bit sola kaydırıp, düşük kelimeyle OR'luyoruz.
-            // Bu işlem byte dizisi/Array.Reverse kullanmadan, doğrudan ve hatasız şekilde 32-bit değeri kurar.
             uint bits = ((uint)highWord << 16) | lowWord;
-
-            // 32-bit'lik ham bit deseni, IEEE 754 standardına göre float olarak yorumlanır.
             return BitConverter.UInt32BitsToSingle(bits);
         }
 
@@ -67,7 +61,7 @@ namespace ModbusTester.Core.Protocol
         /// İki register'ı (32-bit) birleştirip işaretli (signed) Int32 değerine çevirir.
         /// Word sıralaması ToFloat ile birebir aynı mantığı kullanır.
         /// </summary>
-        public static int ToLong(ushort[] registers, bool inverse)
+        public static int ToLong(ReadOnlySpan<ushort> registers, bool inverse)
         {
             ValidateLength(registers, 2, nameof(ToLong));
 
@@ -75,8 +69,6 @@ namespace ModbusTester.Core.Protocol
             ushort lowWord = inverse ? registers[0] : registers[1];
 
             uint bits = ((uint)highWord << 16) | lowWord;
-
-            // unchecked cast: uint'in üst bitini işaret biti olarak yorumlamak için doğrudan int'e çeviriyoruz.
             return unchecked((int)bits);
         }
 
@@ -87,35 +79,26 @@ namespace ModbusTester.Core.Protocol
         ///   inverse=false -> register sırası: [W0(en yüksek), W1, W2, W3(en düşük)]
         ///   inverse=true  -> register sırası tamamen ters çevrilir: [W3(en yüksek), W2, W1, W0(en düşük)]
         /// </summary>
-        public static double ToDouble(ushort[] registers, bool inverse)
+        public static double ToDouble(ReadOnlySpan<ushort> registers, bool inverse)
         {
             ValidateLength(registers, 4, nameof(ToDouble));
 
-            // inverse true ise word sırasını tamamen tersine çeviriyoruz (mbslave'in "Inverse" modu).
-            ushort w0 = inverse ? registers[3] : registers[0]; // En anlamlı (most significant) kelime
+            ushort w0 = inverse ? registers[3] : registers[0];
             ushort w1 = inverse ? registers[2] : registers[1];
             ushort w2 = inverse ? registers[1] : registers[2];
-            ushort w3 = inverse ? registers[0] : registers[3]; // En az anlamlı (least significant) kelime
+            ushort w3 = inverse ? registers[0] : registers[3];
 
-            // 64-bit'lik birleşik değeri 4 adet 16-bit parçayı sırasıyla 48, 32, 16 ve 0 bit kaydırarak kuruyoruz.
-            // Bu, her kelimenin 64-bit'lik değer içindeki doğru konuma (en anlamlıdan en az anlamlıya) yerleşmesini sağlar.
             ulong bits = ((ulong)w0 << 48) | ((ulong)w1 << 32) | ((ulong)w2 << 16) | w3;
-
-            // 64-bit'lik ham bit deseni, IEEE 754 standardına göre double olarak yorumlanır.
             return BitConverter.UInt64BitsToDouble(bits);
         }
 
         /// <summary>
-        /// Dönüştürme metotlarına gelen register dizisinin null olmadığını ve beklenen
-        /// uzunlukta olduğunu doğrular; aksi halde anlamlı bir hata fırlatır.
+        /// ReadOnlySpan bir struct olduğu için null olamaz; null bir diziden dönüştürülmüş span
+        /// otomatik olarak Length=0 üretir ve bu zaten aşağıdaki kontrole takılır — ayrı bir null
+        /// kontrolüne gerek yok.
         /// </summary>
-        private static void ValidateLength(ushort[] registers, int expectedLength, string methodName)
+        private static void ValidateLength(ReadOnlySpan<ushort> registers, int expectedLength, string methodName)
         {
-            if (registers == null)
-            {
-                throw new ArgumentNullException(nameof(registers), $"{methodName}: register dizisi null olamaz.");
-            }
-
             if (registers.Length != expectedLength)
             {
                 throw new ArgumentException(

@@ -220,19 +220,20 @@ namespace ModbusTester
         {
             if (_currentValues == null || _currentValues.Length == 0) return "";
 
+            ushort[] values = _currentValues;
+
             return _dataType switch
             {
-                "Unsigned (16-bit)"       => _currentValues[0].ToString(),
-                "Signed (16-bit)"         => ModbusDataConverter.ToSigned(_currentValues[0]).ToString(),
-                "Hex"                     => _currentValues[0].ToString("X4"),
-                // Inverse kuralı: "Float (32-bit)" okuma sırasında inverse:true kullanır.
-                "Float (32-bit)"          => ModbusDataConverter.ToFloat(_currentValues, inverse: true).ToString("G", CultureInfo.InvariantCulture),
-                "Float Inverse (32-bit)"  => ModbusDataConverter.ToFloat(_currentValues, inverse: false).ToString("G", CultureInfo.InvariantCulture),
-                "Long (32-bit)"           => ModbusDataConverter.ToLong(_currentValues, inverse: true).ToString(),
-                "Long Inverse (32-bit)"   => ModbusDataConverter.ToLong(_currentValues, inverse: false).ToString(),
-                "Double (64-bit)"         => ModbusDataConverter.ToDouble(_currentValues, inverse: true).ToString("G", CultureInfo.InvariantCulture),
-                "Double Inverse (64-bit)" => ModbusDataConverter.ToDouble(_currentValues, inverse: false).ToString("G", CultureInfo.InvariantCulture),
-                _                         => _currentValues[0].ToString()
+                "Unsigned (16-bit)"       => values[0].ToString(),
+                "Signed (16-bit)"         => ModbusDataConverter.ToSigned(values[0]).ToString(),
+                "Hex"                     => values[0].ToString("X4"),
+                "Float (32-bit)"          => ModbusDataConverter.ToFloat(values.AsSpan(), inverse: true).ToString("G", CultureInfo.InvariantCulture),
+                "Float Inverse (32-bit)"  => ModbusDataConverter.ToFloat(values.AsSpan(), inverse: false).ToString("G", CultureInfo.InvariantCulture),
+                "Long (32-bit)"           => ModbusDataConverter.ToLong(values.AsSpan(), inverse: true).ToString(),
+                "Long Inverse (32-bit)"   => ModbusDataConverter.ToLong(values.AsSpan(), inverse: false).ToString(),
+                "Double (64-bit)"         => ModbusDataConverter.ToDouble(values.AsSpan(), inverse: true).ToString("G", CultureInfo.InvariantCulture),
+                "Double Inverse (64-bit)" => ModbusDataConverter.ToDouble(values.AsSpan(), inverse: false).ToString("G", CultureInfo.InvariantCulture),
+                _                         => values[0].ToString()
             };
         }
 

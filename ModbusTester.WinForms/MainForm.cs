@@ -523,6 +523,14 @@ namespace ModbusTester
             session.Dgv.Rows.Clear();
             session.OldValues = null;
             session.OldBitValues = null;
+
+            // Durum senkronizasyonu: Fiziksel grid temizlendiği için hafızadaki çizim state'ini
+            // de mutlak suretle sıfırlıyoruz. Aksi halde bir sonraki başarılı okumada
+            // IsGridLayoutValid yanlışlıkla "layout aynı" sanıp in-place güncelleme moduna girer
+            // ve artık var olmayan Rows[0]'a erişmeye çalışıp ArgumentOutOfRangeException fırlatır.
+            session.RenderedStartAddress = 0;
+            session.RenderedRowCount = 0;
+            session.RenderedDataType = string.Empty;
         }
 
         private PollingParameters GetPollingParametersSafe(TabSession session)
@@ -641,82 +649,120 @@ namespace ModbusTester
 
         private void DisplayBitsInGrid(TabSession session, bool[] bits, ushort startAddress)
         {
-            session.Dgv.Rows.Clear();
-            for (int i = 0; i < bits.Length; i++)
+            const string BitsTypeMarker = "Bits";
+
+            bool layoutValid = IsGridLayoutValid(session, bits.Length, startAddress, BitsTypeMarker);
+
+            if (!layoutValid)
             {
-                ushort itemAddress = (ushort)(startAddress + i);
-                session.Dgv.Rows.Add(itemAddress, bits[i] ? "1" : "0");
+                session.Dgv.Rows.Clear();
+                for (int i = 0; i < bits.Length; i++)
+                {
+                    ushort itemAddress = (ushort)(startAddress + i);
+                    session.Dgv.Rows.Add(itemAddress, bits[i] ? "1" : "0");
+                }
+
+                session.RenderedStartAddress = startAddress;
+                session.RenderedRowCount = bits.Length;
+                session.RenderedDataType = BitsTypeMarker;
             }
+            else
+            {
+                for (int i = 0; i < bits.Length; i++)
+                {
+                    session.Dgv.Rows[i].Cells[1].Value = bits[i] ? "1" : "0";
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Grid'in mevcut düzeninin, yeni okunan verinin düzeniyle uyuşup uyuşmadığını kontrol eder.
+        /// String parçalama YAPMAZ; TabSession üzerinde saklanan son başarılı çizim durumunu
+        /// (satır sayısı, başlangıç adresi, veri tipi) primitif karşılaştırmayla değerlendirir.
+        /// </summary>
+        private bool IsGridLayoutValid(TabSession session, int expectedRowCount, ushort startAddress, string dataType)
+        {
+            return session.RenderedRowCount == expectedRowCount &&
+                   session.RenderedStartAddress == startAddress &&
+                   session.RenderedDataType == dataType;
+        }
+
+        /// <summary>
+        /// Tek bir register grubunun (1/2/4 register) seçili veri tipine göre görüntülenecek değerini hesaplar.
+        /// Span tabanlı ModbusDataConverter metotları çağrılırken heap allocation oluşmaz.
+        /// </summary>
+        private object GetRegisterDisplayValue(ushort[] registers, string dataType, int i, int registerSizePerItem)
+        {
+            switch (dataType)
+            {
+                case "Unsigned (16-bit)": return registers[i];
+                case "Signed (16-bit)":   return ModbusDataConverter.ToSigned(registers[i]);
+                case "Hex":                return ModbusDataConverter.ToHex(registers[i]);
+                case "Binary":             return ModbusDataConverter.ToBinary(registers[i]);
+
+                case "Float (32-bit)":
+                    return ModbusDataConverter.ToFloat(registers.AsSpan(i, registerSizePerItem), inverse: true);
+                case "Float Inverse (32-bit)":
+                    return ModbusDataConverter.ToFloat(registers.AsSpan(i, registerSizePerItem), inverse: false);
+
+                case "Long (32-bit)":
+                    return ModbusDataConverter.ToLong(registers.AsSpan(i, registerSizePerItem), inverse: true);
+                case "Long Inverse (32-bit)":
+                    return ModbusDataConverter.ToLong(registers.AsSpan(i, registerSizePerItem), inverse: false);
+
+                case "Double (64-bit)":
+                    return ModbusDataConverter.ToDouble(registers.AsSpan(i, registerSizePerItem), inverse: true);
+                case "Double Inverse (64-bit)":
+                    return ModbusDataConverter.ToDouble(registers.AsSpan(i, registerSizePerItem), inverse: false);
+
+                default: return registers[i];
+            }
+        }
+
+        private string GetRegisterAddressLabel(ushort itemAddress, int registerSizePerItem)
+        {
+            return registerSizePerItem switch
+            {
+                2 => $"{itemAddress}-{itemAddress + 1}",
+                4 => $"{itemAddress}-{itemAddress + 3}",
+                _ => itemAddress.ToString()
+            };
         }
 
         private void DisplayRegistersInGrid(TabSession session, ushort[] registers, string dataType, ushort startAddress, int registerSizePerItem)
         {
-            session.Dgv.Rows.Clear();
+            int expectedRowCount = registers.Length / registerSizePerItem;
+            bool layoutValid = IsGridLayoutValid(session, expectedRowCount, startAddress, dataType);
 
-            for (int i = 0; i < registers.Length; i += registerSizePerItem)
+            if (!layoutValid)
             {
-                ushort itemAddress = (ushort)(startAddress + i);
+                session.Dgv.Rows.Clear();
 
-                switch (dataType)
+                for (int i = 0; i < registers.Length; i += registerSizePerItem)
                 {
-                    case "Unsigned (16-bit)":
-                        session.Dgv.Rows.Add(itemAddress, registers[i]);
-                        break;
-                    case "Signed (16-bit)":
-                        session.Dgv.Rows.Add(itemAddress, ModbusDataConverter.ToSigned(registers[i]));
-                        break;
-                    case "Hex":
-                        session.Dgv.Rows.Add(itemAddress, ModbusDataConverter.ToHex(registers[i]));
-                        break;
-                    case "Binary":
-                        session.Dgv.Rows.Add(itemAddress, ModbusDataConverter.ToBinary(registers[i]));
-                        break;
-                    case "Float (32-bit)":
-                    {
-                        ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToFloat(slice, inverse: true));
-                        break;
-                    }
-                    case "Float Inverse (32-bit)":
-                    {
-                        ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToFloat(slice, inverse: false));
-                        break;
-                    }
-                    case "Long (32-bit)":
-                    {
-                        ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToLong(slice, inverse: true));
-                        break;
-                    }
-                    case "Long Inverse (32-bit)":
-                    {
-                        ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToLong(slice, inverse: false));
-                        break;
-                    }
-                    case "Double (64-bit)":
-                    {
-                        ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 3}", ModbusDataConverter.ToDouble(slice, inverse: true));
-                        break;
-                    }
-                    case "Double Inverse (64-bit)":
-                    {
-                        ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 3}", ModbusDataConverter.ToDouble(slice, inverse: false));
-                        break;
-                    }
+                    ushort itemAddress = (ushort)(startAddress + i);
+                    string addressLabel = GetRegisterAddressLabel(itemAddress, registerSizePerItem);
+                    object value = GetRegisterDisplayValue(registers, dataType, i, registerSizePerItem);
+                    session.Dgv.Rows.Add(addressLabel, value);
+                }
+
+                session.RenderedStartAddress = startAddress;
+                session.RenderedRowCount = expectedRowCount;
+                session.RenderedDataType = dataType;
+            }
+            else
+            {
+                int rowIndex = 0;
+                for (int i = 0; i < registers.Length; i += registerSizePerItem)
+                {
+                    object value = GetRegisterDisplayValue(registers, dataType, i, registerSizePerItem);
+                    session.Dgv.Rows[rowIndex].Cells[1].Value = value;
+                    rowIndex++;
                 }
             }
         }
 
-        private ushort[] SliceRegisters(ushort[] source, int startIndex, int length)
-        {
-            ushort[] slice = new ushort[length];
-            Array.Copy(source, startIndex, slice, 0, length);
-            return slice;
-        }
+        
 
         // ---------------------------------------------------------
         // LOG YAZDIRMA (Sekmeye Özel Terminal)
@@ -817,20 +863,15 @@ namespace ModbusTester
 
         private async void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
         {
-            // 1. Aşama: Temizlik zaten tamamlandıysa (bu noktaya biz kendimiz this.Close() ile
-            // ikinci kez geldiysek), formun gerçekten kapanmasına izin ver.
+            // 1. Aşama: Temizlik zaten tamamlandıysa formun gerçekten kapanmasına izin ver.
             if (_readyToClose) return;
 
             // 2. Aşama: Kapanmayı GEÇİCİ olarak iptal et; Windows'un formu erken yok etmesini engelle.
             e.Cancel = true;
-
-            // Temizlik sürerken kullanıcının forma müdahale edip yeni state/hata üretmesini önlüyoruz.
             this.Enabled = false;
 
             try
             {
-                // Tüm sekmelerdeki arka plan polling görevlerinin GERÇEKTEN sona ermesini bekliyoruz;
-                // StopPolling zaten cancel -> await join -> dispose sırasını içeriyor.
                 foreach (var session in _sessions)
                 {
                     await StopPolling(session);
@@ -839,14 +880,11 @@ namespace ModbusTester
             }
             catch (Exception)
             {
-                // Temizlik sırasında (log/disconnect vb.) oluşabilecek herhangi bir hatayı yutuyoruz;
-                // amaç formun kilitli/yarım kapanmış bir durumda asılı kalmasını kesinlikle önlemek.
+                // Temizlik sırasında oluşabilecek hataları yutuyoruz; form asılı kalmasın.
             }
             finally
             {
-                // 3. Aşama: Temizlik kesin olarak bitti. Bayrağı kaldır ve formu programatik
-                // olarak tekrar kapat; bu sefer üstteki "if (_readyToClose) return;" devreye girip
-                // gerçek kapanışa izin verecek.
+                // 3. Aşama: Temizlik kesin olarak bitti. Bayrağı kaldır ve formu tekrar kapat.
                 _readyToClose = true;
                 this.Close();
             }
@@ -899,6 +937,10 @@ namespace ModbusTester
             public Button? BtnCloseTab { get; set; }
             public DataGridView Dgv { get; set; } = null!;
             public RichTextBox RtbLogs { get; set; } = null!;
+            
+            public ushort RenderedStartAddress { get; set; }
+            public int RenderedRowCount { get; set; }
+            public string RenderedDataType { get; set; } = string.Empty;
 
             public TabSession(TabPage page) { Page = page; }
         }
