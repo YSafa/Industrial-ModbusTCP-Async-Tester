@@ -1,21 +1,26 @@
 ﻿using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
 using ModbusTester.Core.Core;
 using ModbusTester.Core.Exceptions;
 
 // ---------------------------------------------------------
-// SABİT PARAMETRELER (Yerel test için hardcoded)
+// DİNAMİK KONFİGÜRASYON ALTYAPISI
 // ---------------------------------------------------------
-const string TargetIp        = "127.0.0.1";
-const int    TargetPort      = 502;
-const byte   SlaveId         = 1;
-const ushort StartAddress    = 0;
-const ushort Quantity        = 135;
-const int    PollingIntervalMs = 500;
-const int    ReconnectMaxAttempts = 5;
-const int    ReconnectDelayMs     = 2000;
-const int    HeartbeatCycleInterval = 100;
+IConfigurationRoot config = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    .Build();
+
+// "ModbusSettings" bölümüne referans; reloadOnChange sayesinde dosya değiştiğinde
+// bu section nesnesi arkada otomatik güncellenir, tekrar Build() çağırmaya gerek yoktur.
+IConfigurationSection settings = config.GetSection("ModbusSettings");
+
+// Bağlantı parametrelerini (IP/Port) yalnızca ModbusClient oluşturulurken bir kez okuyoruz;
+// bunlar runtime'da değişirse ayrı bir mantıkla client yeniden kurulacak (aşağıda ele alınıyor).
+string currentIp   = settings.GetValue<string>("TargetIp")   ?? "127.0.0.1";
+int    currentPort = settings.GetValue<int?>("TargetPort")   ?? 502;
 
 // ---------------------------------------------------------
 // GRACEFUL SHUTDOWN: Ctrl+C sinyalini yakalayıp CancellationToken'a bağlıyoruz.
@@ -29,18 +34,18 @@ Console.CancelKeyPress += (sender, e) =>
     cts.Cancel();
 };
 
-Log("Modbus TCP Console Driver başlatılıyor...", ConsoleColor.Cyan);
+Log("Modbus TCP Console Driver başlatılıyor (appsettings.json ile dinamik konfigürasyon)...", ConsoleColor.Cyan);
 
-var client = new ModbusClient(TargetIp, TargetPort)
+var client = new ModbusClient(currentIp, currentPort)
 {
-    ConnectTimeoutMs = 3000,
-    IoTimeoutMs = 3000
+    ConnectTimeoutMs = settings.GetValue<int?>("ConnectTimeoutMs") ?? 3000,
+    IoTimeoutMs       = settings.GetValue<int?>("IoTimeoutMs")     ?? 3000
 };
 
 try
 {
     await client.ConnectAsync();
-    Log($"'{TargetIp}:{TargetPort}' adresine bağlantı başarılı.", ConsoleColor.Green);
+    Log($"'{currentIp}:{currentPort}' adresine bağlantı başarılı.", ConsoleColor.Green);
 }
 catch (ModbusConnectionException ex)
 {
@@ -54,26 +59,84 @@ catch (ModbusTimeoutException ex)
 }
 
 // ---------------------------------------------------------
-// ANA POLLING DÖNGÜSÜ: PeriodicTimer ile modern, tick-drift'siz zamanlama.
+// ANA POLLING DÖNGÜSÜ: PeriodicTimer + her turda config'den canlı okuma.
+// PeriodicTimer'ın aralığı runtime'da değiştirilemediği için, interval değişikliği
+// algılandığında timer Dispose edilip yeni aralıkla yeniden oluşturuluyor.
 // ---------------------------------------------------------
-using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(PollingIntervalMs));
 long cycleCounter = 0;
-
-// Değişim takibi için önceki okumayı saklayan referans; null-safe olarak tanımlandı.
 ushort[]? oldValues = null;
+
+int lastKnownIntervalMs = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
+PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromMilliseconds(lastKnownIntervalMs));
 
 try
 {
-    while (await timer.WaitForNextTickAsync(cts.Token))
+    while (!cts.Token.IsCancellationRequested)
     {
+        bool tickReceived;
+        try
+        {
+            tickReceived = await timer.WaitForNextTickAsync(cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+
+        if (!tickReceived) break;
+
         cycleCounter++;
+
+        // --- Her döngü adımında en güncel ayarları config'den okuyoruz. ---
+        byte   liveSlaveId      = (byte)(settings.GetValue<int?>("SlaveId") ?? 1);
+        ushort liveStartAddress = (ushort)(settings.GetValue<int?>("StartAddress") ?? 0);
+        ushort liveQuantity     = (ushort)(settings.GetValue<int?>("Quantity") ?? 1);
+        int    liveIntervalMs   = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
+        string liveIp           = settings.GetValue<string>("TargetIp") ?? currentIp;
+        int    livePort         = settings.GetValue<int?>("TargetPort") ?? currentPort;
+
+        // --- Polling aralığı değiştiyse timer'ı yeni süreyle yeniden oluştur. ---
+        if (liveIntervalMs != lastKnownIntervalMs && liveIntervalMs > 0)
+        {
+            Log($"Polling aralığı değişti: {lastKnownIntervalMs}ms -> {liveIntervalMs}ms. Timer yeniden başlatılıyor.", ConsoleColor.Cyan);
+            timer.Dispose();
+            timer = new PeriodicTimer(TimeSpan.FromMilliseconds(liveIntervalMs));
+            lastKnownIntervalMs = liveIntervalMs;
+        }
+
+        // --- IP/Port değiştiyse mevcut bağlantıyı kapatıp ModbusClient'ı yeniden kur. ---
+        if (liveIp != currentIp || livePort != currentPort)
+        {
+            Log($"Bağlantı parametreleri değişti: '{currentIp}:{currentPort}' -> '{liveIp}:{livePort}'. Yeniden bağlanılıyor.", ConsoleColor.Cyan);
+
+            client.Disconnect();
+            currentIp   = liveIp;
+            currentPort = livePort;
+
+            client = new ModbusClient(currentIp, currentPort)
+            {
+                ConnectTimeoutMs = settings.GetValue<int?>("ConnectTimeoutMs") ?? 3000,
+                IoTimeoutMs       = settings.GetValue<int?>("IoTimeoutMs")     ?? 3000
+            };
+
+            try
+            {
+                await client.ConnectAsync();
+                Log($"'{currentIp}:{currentPort}' adresine yeniden bağlantı başarılı.", ConsoleColor.Green);
+                oldValues = null; // Yeni cihaz/bağlantı; önceki veri karşılaştırması artık geçersiz.
+            }
+            catch (Exception ex)
+            {
+                Log($"Yeni parametrelerle bağlantı kurulamadı: {ex.Message}", ConsoleColor.Red);
+                continue; // Bu turu atla, bir sonraki tick'te tekrar denenecek.
+            }
+        }
 
         try
         {
-            ushort[] registers = await client.ReadHoldingRegistersAsync(SlaveId, StartAddress, Quantity);
+            ushort[] registers = await client.ReadHoldingRegistersAsync(liveSlaveId, liveStartAddress, liveQuantity);
 
-            // Span tabanlı karşılaştırma: byte-level SIMD hızlandırmalı, allocation'sız ve çok hızlı.
-            // oldValues null ise (ilk okuma) veya dizi içerik olarak değiştiyse "değişti" sayılır.
+            // Span tabanlı, allocation'sız karşılaştırma; sadece veri değiştiğinde loglama tetiklenir.
             bool hasChanged = oldValues == null ||
                               !MemoryExtensions.SequenceEqual<ushort>(oldValues.AsSpan(), registers.AsSpan());
 
@@ -84,12 +147,10 @@ try
                 string values = string.Join(", ", registers);
                 Log($"[DATA CHANGED - Cycle #{cycleCounter}] -> [{values}]", ConsoleColor.Green);
             }
-            else if (cycleCounter % HeartbeatCycleInterval == 0)
+            else if (cycleCounter % 100 == 0)
             {
-                // Veri değişmese bile driver'ın donmadığını kanıtlamak için periyodik nabız sinyali.
                 Log($"[HEARTBEAT - Cycle #{cycleCounter}] Driver alive, data stream stable.", ConsoleColor.DarkGray);
             }
-            // Veri değişmedi ve heartbeat turu değilse: tamamen sessiz kal (CPU/IO tasarrufu).
         }
         catch (ModbusProtocolException ex)
         {
@@ -98,9 +159,6 @@ try
         catch (ModbusTimeoutException ex)
         {
             Log($"ZAMAN AŞIMI: {ex.Message}", ConsoleColor.Red);
-
-            // Bağlantı koptuğu için önceki veri hafızası artık geçersiz; sıfırlıyoruz ki
-            // yeniden bağlanınca ilk gelen veri doğru şekilde "değişti" sayılıp loglansın.
             oldValues = null;
 
             bool reconnected = await TryReconnectAsync();
@@ -113,7 +171,6 @@ try
         catch (ModbusConnectionException ex)
         {
             Log($"BAĞLANTI HATASI: {ex.Message}", ConsoleColor.Red);
-
             oldValues = null;
 
             bool reconnected = await TryReconnectAsync();
@@ -125,32 +182,32 @@ try
         }
     }
 }
-catch (OperationCanceledException)
-{
-    // Ctrl+C ile normal şekilde iptal edildi.
-}
 finally
 {
+    timer.Dispose();
     client.Disconnect();
     Log("Bağlantı kapatıldı, uygulama sonlandırıldı.", ConsoleColor.Cyan);
 }
 
 // ---------------------------------------------------------
-// YARDIMCI YEREL METOTLAR (Non-static: dış kapsamdaki const/local değişkenleri
+// YARDIMCI YEREL METOTLAR (Non-static: dış kapsamdaki değişkenleri/config'i
 // closure ile yakalayabilmek için CS8421 hatasından kaçınmak amacıyla static değildir)
 // ---------------------------------------------------------
 
 async Task<bool> TryReconnectAsync()
 {
-    for (int attempt = 1; attempt <= ReconnectMaxAttempts; attempt++)
+    int maxAttempts = settings.GetValue<int?>("ReconnectMaxAttempts") ?? 5;
+    int delayMs      = settings.GetValue<int?>("ReconnectDelayMs")     ?? 2000;
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
     {
         if (cts.Token.IsCancellationRequested) return false;
 
-        Log($"Yeniden bağlanılıyor... Deneme {attempt}/{ReconnectMaxAttempts}", ConsoleColor.Yellow);
+        Log($"Yeniden bağlanılıyor... Deneme {attempt}/{maxAttempts}", ConsoleColor.Yellow);
 
         try
         {
-            await Task.Delay(ReconnectDelayMs, cts.Token);
+            await Task.Delay(delayMs, cts.Token);
             await client.ConnectAsync();
 
             Log("Yeniden bağlantı başarılı, polling devam ediyor.", ConsoleColor.Green);
