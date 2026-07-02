@@ -21,8 +21,9 @@ namespace ModbusTester.Core.Protocol
             // değerin atomik (kesintisiz) şekilde artmasını garanti eder.
             int next = Interlocked.Increment(ref _currentTransactionId);
 
-            // 2 byte'lık (0-65535) sınırı aştığımızda başa sarmak için modulo alıyoruz.
-            return (ushort)(next % 65536);
+            // (ushort) cast'i zaten alt 16 biti alıp üst bitleri düşürerek taşma durumunda
+            // otomatik başa sarmayı garanti eder; modulo işlemine gerek yok.
+            return (ushort)next;
         }
     }
 }
