@@ -82,7 +82,7 @@ namespace ModbusTester
             numPollingInterval.Value = 200;
             numQuantity.Value        = 1;
             numQuantity.Minimum      = 1;
-            numQuantity.Maximum      = 150;
+            numQuantity.Maximum      = 500;
 
             cmbFunctionCode.SelectedIndexChanged += CmbFunctionCode_SelectedIndexChanged;
         }
@@ -471,11 +471,11 @@ namespace ModbusTester
             int registerSizePerItem = GetRegisterSizeForDataType(parameters.DataType);
             int totalQuantity = parameters.UserQuantity * registerSizePerItem;
 
-            if (totalQuantity > 125)
+            /*if (totalQuantity > 125)
             {
                 throw new ArgumentOutOfRangeException(
                     nameof(totalQuantity), "Toplam register sayısı 125'i aşıyor; adet veya veri tipini azaltın.");
-            }
+            }*/
 
             if (_modbusClient == null) return;
             
