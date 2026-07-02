@@ -1,7 +1,9 @@
 ﻿using System;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
+using ModbusTester.Core;
 using ModbusTester.Core.Core;
 using ModbusTester.Core.Exceptions;
 
@@ -13,12 +15,8 @@ IConfigurationRoot config = new ConfigurationBuilder()
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
     .Build();
 
-// "ModbusSettings" bölümüne referans; reloadOnChange sayesinde dosya değiştiğinde
-// bu section nesnesi arkada otomatik güncellenir, tekrar Build() çağırmaya gerek yoktur.
 IConfigurationSection settings = config.GetSection("ModbusSettings");
 
-// Bağlantı parametrelerini (IP/Port) yalnızca ModbusClient oluşturulurken bir kez okuyoruz;
-// bunlar runtime'da değişirse ayrı bir mantıkla client yeniden kurulacak (aşağıda ele alınıyor).
 string currentIp   = settings.GetValue<string>("TargetIp")   ?? "127.0.0.1";
 int    currentPort = settings.GetValue<int?>("TargetPort")   ?? 502;
 
@@ -59,12 +57,16 @@ catch (ModbusTimeoutException ex)
 }
 
 // ---------------------------------------------------------
-// ANA POLLING DÖNGÜSÜ: PeriodicTimer + her turda config'den canlı okuma.
-// PeriodicTimer'ın aralığı runtime'da değiştirilemediği için, interval değişikliği
-// algılandığında timer Dispose edilip yeni aralıkla yeniden oluşturuluyor.
+// ANA POLLING DÖNGÜSÜ
 // ---------------------------------------------------------
 long cycleCounter = 0;
+
 ushort[]? oldValues = null;
+ushort oldStartAddress = 0;
+
+// Hata tekrarını (log spam'ini) önlemek için son loglanan hata mesajını saklıyoruz.
+// null ise "hata durumunda değiliz" anlamına gelir.
+string? lastLoggedError = null;
 
 int lastKnownIntervalMs = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
 PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromMilliseconds(lastKnownIntervalMs));
@@ -87,7 +89,6 @@ try
 
         cycleCounter++;
 
-        // --- Her döngü adımında en güncel ayarları config'den okuyoruz. ---
         byte   liveSlaveId      = (byte)(settings.GetValue<int?>("SlaveId") ?? 1);
         ushort liveStartAddress = (ushort)(settings.GetValue<int?>("StartAddress") ?? 0);
         ushort liveQuantity     = (ushort)(settings.GetValue<int?>("Quantity") ?? 1);
@@ -95,7 +96,6 @@ try
         string liveIp           = settings.GetValue<string>("TargetIp") ?? currentIp;
         int    livePort         = settings.GetValue<int?>("TargetPort") ?? currentPort;
 
-        // --- Polling aralığı değiştiyse timer'ı yeni süreyle yeniden oluştur. ---
         if (liveIntervalMs != lastKnownIntervalMs && liveIntervalMs > 0)
         {
             Log($"Polling aralığı değişti: {lastKnownIntervalMs}ms -> {liveIntervalMs}ms. Timer yeniden başlatılıyor.", ConsoleColor.Cyan);
@@ -104,7 +104,6 @@ try
             lastKnownIntervalMs = liveIntervalMs;
         }
 
-        // --- IP/Port değiştiyse mevcut bağlantıyı kapatıp ModbusClient'ı yeniden kur. ---
         if (liveIp != currentIp || livePort != currentPort)
         {
             Log($"Bağlantı parametreleri değişti: '{currentIp}:{currentPort}' -> '{liveIp}:{livePort}'. Yeniden bağlanılıyor.", ConsoleColor.Cyan);
@@ -123,12 +122,12 @@ try
             {
                 await client.ConnectAsync();
                 Log($"'{currentIp}:{currentPort}' adresine yeniden bağlantı başarılı.", ConsoleColor.Green);
-                oldValues = null; // Yeni cihaz/bağlantı; önceki veri karşılaştırması artık geçersiz.
+                oldValues = null;
             }
             catch (Exception ex)
             {
                 Log($"Yeni parametrelerle bağlantı kurulamadı: {ex.Message}", ConsoleColor.Red);
-                continue; // Bu turu atla, bir sonraki tick'te tekrar denenecek.
+                continue;
             }
         }
 
@@ -136,29 +135,56 @@ try
         {
             ushort[] registers = await client.ReadHoldingRegistersAsync(liveSlaveId, liveStartAddress, liveQuantity);
 
-            // Span tabanlı, allocation'sız karşılaştırma; sadece veri değiştiğinde loglama tetiklenir.
-            bool hasChanged = oldValues == null ||
-                              !MemoryExtensions.SequenceEqual<ushort>(oldValues.AsSpan(), registers.AsSpan());
-
-            if (hasChanged)
+            // Başarılı okuma gerçekleşti; eğer sistem daha önce bir hata durumundaysa, bunu
+            // belirgin bir "RECOVERY" mesajıyla bildiriyoruz ve hata hafızasını sıfırlıyoruz.
+            if (lastLoggedError != null)
             {
-                oldValues = registers;
+                Log("[RECOVERY] Driver successfully recovered from previous errors. Data stream is back to normal.", ConsoleColor.Cyan);
+                lastLoggedError = null;
+            }
 
-                string values = string.Join(", ", registers);
-                Log($"[DATA CHANGED - Cycle #{cycleCounter}] -> [{values}]", ConsoleColor.Green);
+            bool layoutChanged = oldValues == null ||
+                                 oldValues.Length != registers.Length ||
+                                 oldStartAddress != liveStartAddress;
+
+            string? changeLog = layoutChanged
+                ? BuildFullChangeLog(registers, liveStartAddress)
+                : BuildDiffChangeLog(oldValues!, registers, liveStartAddress);
+
+            if (changeLog != null)
+            {
+                Log($"[DATA CHANGED - Cycle #{cycleCounter}] -> {changeLog}", ConsoleColor.Green);
             }
             else if (cycleCounter % 100 == 0)
             {
                 Log($"[HEARTBEAT - Cycle #{cycleCounter}] Driver alive, data stream stable.", ConsoleColor.DarkGray);
             }
+
+            oldValues = registers;
+            oldStartAddress = liveStartAddress;
         }
         catch (ModbusProtocolException ex)
         {
-            Log($"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}", ConsoleColor.Red);
+            string errorMessage = $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}";
+
+            // Aynı hata art arda tekrar ediyorsa sessizce geçiyoruz; yalnızca ilk görüldüğünde
+            // veya bir öncekinden farklıysa loglanıyor.
+            if (lastLoggedError != errorMessage)
+            {
+                Log(errorMessage, ConsoleColor.Red);
+                lastLoggedError = errorMessage;
+            }
         }
         catch (ModbusTimeoutException ex)
         {
-            Log($"ZAMAN AŞIMI: {ex.Message}", ConsoleColor.Red);
+            string errorMessage = $"ZAMAN AŞIMI: {ex.Message}";
+
+            if (lastLoggedError != errorMessage)
+            {
+                Log(errorMessage, ConsoleColor.Red);
+                lastLoggedError = errorMessage;
+            }
+
             oldValues = null;
 
             bool reconnected = await TryReconnectAsync();
@@ -170,7 +196,14 @@ try
         }
         catch (ModbusConnectionException ex)
         {
-            Log($"BAĞLANTI HATASI: {ex.Message}", ConsoleColor.Red);
+            string errorMessage = $"BAĞLANTI HATASI: {ex.Message}";
+
+            if (lastLoggedError != errorMessage)
+            {
+                Log(errorMessage, ConsoleColor.Red);
+                lastLoggedError = errorMessage;
+            }
+
             oldValues = null;
 
             bool reconnected = await TryReconnectAsync();
@@ -193,6 +226,37 @@ finally
 // YARDIMCI YEREL METOTLAR (Non-static: dış kapsamdaki değişkenleri/config'i
 // closure ile yakalayabilmek için CS8421 hatasından kaçınmak amacıyla static değildir)
 // ---------------------------------------------------------
+
+string BuildFullChangeLog(ushort[] registers, ushort startAddress)
+{
+    var sb = new StringBuilder();
+
+    for (int i = 0; i < registers.Length; i++)
+    {
+        ushort actualAddress = (ushort)(startAddress + i);
+        sb.Append($"[{actualAddress}: {registers[i]}] ");
+    }
+
+    return sb.ToString().TrimEnd();
+}
+
+string? BuildDiffChangeLog(ushort[] oldRegisters, ushort[] newRegisters, ushort startAddress)
+{
+    var sb = new StringBuilder();
+    bool anyChanged = false;
+
+    for (int i = 0; i < newRegisters.Length; i++)
+    {
+        if (oldRegisters[i] != newRegisters[i])
+        {
+            anyChanged = true;
+            ushort actualAddress = (ushort)(startAddress + i);
+            sb.Append($"[{actualAddress}: {oldRegisters[i]} -> {newRegisters[i]}] ");
+        }
+    }
+
+    return anyChanged ? sb.ToString().TrimEnd() : null;
+}
 
 async Task<bool> TryReconnectAsync()
 {
