@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.Sockets;
 using ModbusTester.Core.Exceptions;
 using ModbusTester.Core.Protocol;
@@ -230,27 +231,38 @@ namespace ModbusTester.Core.Core
                 throw new ModbusConnectionException("İstek gönderilemedi: aktif bir bağlantı yok.");
             }
 
-            // Semaphore: aynı anda yalnızca bir transaction soketi kullanabilir.
             await _networkSemaphore.WaitAsync();
+
+            byte[] rentBuffer = ArrayPool<byte>.Shared.Rent(260);
 
             try
             {
                 using var cts = new CancellationTokenSource(IoTimeoutMs);
 
-                // Null-forgiving (!) operatörü: bu noktada yukarıdaki guard clause'u geçtiğimiz için
-                // _networkStream kesinlikle null değildir; derleyiciye bunu bildiriyoruz.
                 await _networkStream!.WriteAsync(requestBuffer, 0, requestBuffer.Length, cts.Token);
 
-                byte[] header = await ReadExactAsync(6, cts.Token);
+                await ReadExactAsync(rentBuffer, 0, 6, cts.Token);
 
-                // MBAP Length alanı Big-Endian: kalan byte sayısını bit kaydırmayla hesaplıyoruz.
-                ushort remainingLength = (ushort)((header[4] << 8) | header[5]);
+                ushort remainingLength = (ushort)((rentBuffer[4] << 8) | rentBuffer[5]);
 
-                byte[] remainingBody = await ReadExactAsync(remainingLength, cts.Token);
+                if (remainingLength < 2 || remainingLength > 254)
+                {
+                    // Akış hizası tamamen kaybolduğu için soketi derhal kapatıyoruz.
+                    Disconnect();
 
-                byte[] fullResponse = new byte[6 + remainingBody.Length];
-                Buffer.BlockCopy(header, 0, fullResponse, 0, header.Length);
-                Buffer.BlockCopy(remainingBody, 0, fullResponse, header.Length, remainingBody.Length);
+                    // Hata tipi ModbusConnectionException: bu bir cihaz-seviyesi protokol hatası değil,
+                    // bizim stream'i güvenilir okuyamadığımızın kanıtı olan bir bağlantı bütünlüğü sorunudur.
+                    // Üst katmanların (WinForms/Console) bunu ModbusTimeoutException/ModbusConnectionException
+                    // ile aynı kefeye koyup TryReconnectAsync'i O AN, gecikmesiz tetiklemesini sağlar.
+                    throw new ModbusConnectionException(
+                        $"Ağ protokol ihlali: Geçersiz paket uzunluğu algılandı ({remainingLength} byte). Akış senkronizasyonu kaybolduğu için bağlantı sonlandırıldı."
+                    );
+                }
+
+                await ReadExactAsync(rentBuffer, 6, remainingLength, cts.Token);
+
+                byte[] fullResponse = new byte[6 + remainingLength];
+                Buffer.BlockCopy(rentBuffer, 0, fullResponse, 0, fullResponse.Length);
 
                 return fullResponse;
             }
@@ -265,8 +277,16 @@ namespace ModbusTester.Core.Core
                 Disconnect();
                 throw new ModbusConnectionException($"Ağ üzerinden veri alışverişinde hata: {socketEx.Message}", socketEx);
             }
+            catch (ModbusConnectionException)
+            {
+                // Guard clause'dan gelen (Disconnect zaten çağrılmış) ModbusConnectionException'ı
+                // olduğu gibi yukarı taşıyoruz; tekrar Disconnect() çağırıp yeniden sarmalamaya gerek yok.
+                throw;
+            }
             catch (ModbusProtocolException)
             {
+                // Yalnızca cihazdan gelen meşru Modbus exception yanıtları (0x01-0x0B) için ayrılmıştır;
+                // bağlantı sağlam kaldığı için Disconnect() çağrılmadan olduğu gibi yukarı taşınır.
                 throw;
             }
             catch (Exception ex)
@@ -276,30 +296,31 @@ namespace ModbusTester.Core.Core
             }
             finally
             {
-                // Başarı veya hata fark etmeksizin semaphore her koşulda serbest bırakılır.
+                ArrayPool<byte>.Shared.Return(rentBuffer);
                 _networkSemaphore.Release();
             }
         }
 
-        private async Task<byte[]> ReadExactAsync(int byteCount, CancellationToken token)
+        /// <summary>
+        /// NetworkStream'den tam olarak istenen sayıda byte'ı, dışarıdan verilen tampona (buffer)
+        /// belirtilen offset'ten itibaren okur. Artık kendi dizisini tahsis etmiyor; çağıran taraf
+        /// (SendAndReceiveAsync) havuzdan kiraladığı tamponu bu metoda geçiriyor.
+        /// </summary>
+        private async Task ReadExactAsync(byte[] buffer, int offset, int byteCount, CancellationToken token)
         {
-            byte[] buffer = new byte[byteCount];
             int totalRead = 0;
 
             while (totalRead < byteCount)
             {
-                int read = await _networkStream!.ReadAsync(buffer, totalRead, byteCount - totalRead, token);
+                int read = await _networkStream!.ReadAsync(buffer, offset + totalRead, byteCount - totalRead, token);
 
                 if (read == 0)
                 {
-                    throw new ModbusConnectionException(
-                        "Bağlantı karşı taraf tarafından beklenmedik şekilde kapatıldı.");
+                    throw new ModbusConnectionException("Bağlantı karşı taraf tarafından beklenmedik şekilde kapatıldı.");
                 }
 
                 totalRead += read;
             }
-
-            return buffer;
         }
     }
 }
