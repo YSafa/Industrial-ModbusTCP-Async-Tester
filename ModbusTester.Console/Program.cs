@@ -6,6 +6,7 @@ using Microsoft.Extensions.Configuration;
 using ModbusTester.Core;
 using ModbusTester.Core.Core;
 using ModbusTester.Core.Exceptions;
+using ModbusTester.Core.Protocol;
 
     // ---------------------------------------------------------
     // DİNAMİK KONFİGÜRASYON ALTYAPISI
@@ -63,15 +64,16 @@ using ModbusTester.Core.Exceptions;
 
     ushort[]? oldValues = null;
     ushort oldStartAddress = 0;
+    string lastKnownDataType = settings.GetValue<string>("DataType") ?? "Unsigned (16-bit)";
+    int lastKnownRegisterSize = GetRegisterSizeForDataType(lastKnownDataType);
 
-    // Hata tekrarını (log spam'ini) önlemek için son loglanan hata mesajını saklıyoruz.
-    // null ise "hata durumunda değiliz" anlamına gelir.
     string? lastLoggedError = null;
 
     int lastKnownIntervalMs = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
-    
-    ushort[] readBuffer = new ushort[Math.Max(1, (int)(settings.GetValue<int?>("Quantity") ?? 1))];
-    
+
+    int initialQuantity = settings.GetValue<int?>("Quantity") ?? 1;
+    ushort[] readBuffer = new ushort[Math.Max(1, initialQuantity) * lastKnownRegisterSize];
+
     PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromMilliseconds(lastKnownIntervalMs));
 
     try
@@ -94,10 +96,11 @@ using ModbusTester.Core.Exceptions;
 
             byte   liveSlaveId      = (byte)(settings.GetValue<int?>("SlaveId") ?? 1);
             ushort liveStartAddress = (ushort)(settings.GetValue<int?>("StartAddress") ?? 0);
-            ushort liveQuantity     = (ushort)(settings.GetValue<int?>("Quantity") ?? 1);
+            int    liveQuantity     = settings.GetValue<int?>("Quantity") ?? 1;
             int    liveIntervalMs   = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
             string liveIp           = settings.GetValue<string>("TargetIp") ?? currentIp;
             int    livePort         = settings.GetValue<int?>("TargetPort") ?? currentPort;
+            string liveDataType     = settings.GetValue<string>("DataType") ?? "Unsigned (16-bit)";
 
             if (liveIntervalMs != lastKnownIntervalMs && liveIntervalMs > 0)
             {
@@ -136,42 +139,59 @@ using ModbusTester.Core.Exceptions;
 
             try
             {
-                if (readBuffer.Length != liveQuantity)
+                // DataType değiştiyse eleman başına register boyutu (1/2/4) yeniden hesaplanıyor.
+                int liveRegisterSize = GetRegisterSizeForDataType(liveDataType);
+
+                // Tampon boyutu artık Quantity * registerSizePerItem; Quantity veya DataType
+                // değiştiğinde tampon yeniden boyutlandırılıyor (nadir olay, her tick değil).
+                int requiredLength = Math.Max(1, liveQuantity) * liveRegisterSize;
+                if (readBuffer.Length != requiredLength)
                 {
-                    readBuffer = new ushort[liveQuantity];
+                    readBuffer = new ushort[requiredLength];
                     oldValues = null;
                 }
 
                 await client.ReadHoldingRegistersAsync(liveSlaveId, liveStartAddress, readBuffer);
 
-                bool layoutChanged = oldValues == null || oldValues.Length != readBuffer.Length || oldStartAddress != liveStartAddress;
+                if (lastLoggedError != null)
+                {
+                    Log("[RECOVERY] Driver successfully recovered from previous errors. Data stream is back to normal.", ConsoleColor.Cyan);
+                    lastLoggedError = null;
+                }
+
+                bool layoutChanged = oldValues == null ||
+                                     oldValues.Length != readBuffer.Length ||
+                                     oldStartAddress != liveStartAddress ||
+                                     lastKnownDataType != liveDataType;
 
                 string? changeLog = layoutChanged
-                    ? BuildFullChangeLog(readBuffer, liveStartAddress)
-                    : BuildDiffChangeLog(oldValues!, readBuffer, liveStartAddress);
+                    ? BuildFullChangeLog(readBuffer, liveStartAddress, liveDataType, liveRegisterSize)
+                    : BuildDiffChangeLog(oldValues!, readBuffer, liveStartAddress, liveDataType, liveRegisterSize);
 
                 if (changeLog != null)
                 {
                     Log($"[DATA CHANGED - Cycle #{cycleCounter}] -> {changeLog}", ConsoleColor.Green);
+                    
+                    // Bellek koruması: Klonlamayı SADECE veri gerçekten değiştiğinde 
+                    // veya ilk bağlantı/layout değişimi anında yapıyoruz!
+                    oldValues = (ushort[])readBuffer.Clone();
+                    oldStartAddress = liveStartAddress;
+                    lastKnownDataType = liveDataType;
+                    lastKnownRegisterSize = liveRegisterSize;
                 }
                 else if (cycleCounter % 100 == 0)
                 {
                     Log($"[HEARTBEAT - Cycle #{cycleCounter}] Driver alive, data stream stable.", ConsoleColor.DarkGray);
                 }
 
-                oldValues = (ushort[])readBuffer.Clone();
-                oldStartAddress = liveStartAddress;
+                
             }
             catch (ModbusProtocolException ex)
             {
-                // Kapanış sinyali zaten verildiyse, bu tick'teki protokol hatasını loglamaya
-                // veya işlemeye devam etmenin bir anlamı yok; döngü anında ve temizce kırılır.
                 if (cts.Token.IsCancellationRequested) break;
-                
+
                 string errorMessage = $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}";
 
-                // Aynı hata art arda tekrar ediyorsa sessizce geçiyoruz; yalnızca ilk görüldüğünde
-                // veya bir öncekinden farklıysa loglanıyor.
                 if (lastLoggedError != errorMessage)
                 {
                     Log(errorMessage, ConsoleColor.Red);
@@ -181,7 +201,7 @@ using ModbusTester.Core.Exceptions;
             catch (ModbusTimeoutException ex)
             {
                 if (cts.Token.IsCancellationRequested) break;
-                
+
                 string errorMessage = $"ZAMAN AŞIMI: {ex.Message}";
 
                 if (lastLoggedError != errorMessage)
@@ -202,7 +222,7 @@ using ModbusTester.Core.Exceptions;
             catch (ModbusConnectionException ex)
             {
                 if (cts.Token.IsCancellationRequested) break;
-                
+
                 string errorMessage = $"BAĞLANTI HATASI: {ex.Message}";
 
                 if (lastLoggedError != errorMessage)
@@ -220,6 +240,18 @@ using ModbusTester.Core.Exceptions;
                     break;
                 }
             }
+            catch (Exception ex)
+            {
+                if (cts.Token.IsCancellationRequested) break;
+
+                string errorMessage = $"BEKLENMEYEN HATA: {ex.Message}";
+
+                if (lastLoggedError != errorMessage)
+                {
+                    Log(errorMessage, ConsoleColor.Red);
+                    lastLoggedError = errorMessage;
+                }
+            }
         }
     }
     finally
@@ -234,31 +266,113 @@ using ModbusTester.Core.Exceptions;
     // closure ile yakalayabilmek için CS8421 hatasından kaçınmak amacıyla static değildir)
     // ---------------------------------------------------------
 
-    string BuildFullChangeLog(ushort[] registers, ushort startAddress)
+    /// <summary>
+    /// Seçili veri tipinin tek bir değeri ifade etmek için kaç register (word) kapladığını döndürür.
+    /// WinForms tarafındaki GetRegisterSizeForDataType ile birebir aynı mantık.
+    /// </summary>
+    /*
+    ===================================================================
+    DESTEKLENEN MODBUS DATA TYPE (VERİ TİPİ) SEÇENEKLERİ
+        ===================================================================
+    Aşağıdaki metinler appsettings.json içerisindeki "DataType" alanına 
+    birebir (büyük/küçük harf duyarlı) yazılarak kullanılmalıdır:
+
+    - "Unsigned (16-bit)"       -> Standart 1 word ham register (0 - 65535)
+        - "Signed (16-bit)"         -> İşaretli 1 word register (-32768 - 32767)
+        - "Hex"                     -> 16'lık tabanda gösterim (Örn: A4F2)
+        - "Binary"                  -> 16-bit ikilik taban gösterimi (Örn: 1010...)
+    - "Float (32-bit)"          -> 2 word Big-Endian Float
+        - "Float Inverse (32-bit)"  -> 2 word Little-Endian Float
+        - "Long (32-bit)"           -> 2 word Big-Endian 32-bit Integer
+        - "Long Inverse (32-bit)"   -> 2 word Little-Endian 32-bit Integer
+        - "Double (64-bit)"         -> 4 word Big-Endian 64-bit Float
+        - "Double Inverse (64-bit)" -> 4 word Little-Endian 64-bit Float
+        ===================================================================
+    */
+    int GetRegisterSizeForDataType(string dataType)
+    {
+        return dataType switch
+        {
+            "Float (32-bit)" or "Float Inverse (32-bit)" or
+            "Long (32-bit)"  or "Long Inverse (32-bit)"   => 2,
+            "Double (64-bit)" or "Double Inverse (64-bit)" => 4,
+            _ => 1
+        };
+    }
+
+    /// <summary>
+    /// Tek bir register grubunun (1/2/4 register) seçili veri tipine göre görüntülenecek değerini
+    /// hesaplar. AsSpan ile dilimleme yapıldığı için heap allocation oluşmaz.
+    /// </summary>
+    string GetRegisterDisplayValue(ushort[] registers, string dataType, int i, int registerSizePerItem)
+    {
+        switch (dataType)
+        {
+            case "Unsigned (16-bit)": return registers[i].ToString();
+            case "Signed (16-bit)":   return ModbusDataConverter.ToSigned(registers[i]).ToString();
+            case "Hex":                return ModbusDataConverter.ToHex(registers[i]);
+            case "Binary":             return ModbusDataConverter.ToBinary(registers[i]);
+
+            case "Float (32-bit)":
+                return ModbusDataConverter.ToFloat(registers.AsSpan(i, registerSizePerItem), inverse: true).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            case "Float Inverse (32-bit)":
+                return ModbusDataConverter.ToFloat(registers.AsSpan(i, registerSizePerItem), inverse: false).ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            case "Long (32-bit)":
+                return ModbusDataConverter.ToLong(registers.AsSpan(i, registerSizePerItem), inverse: true).ToString();
+            case "Long Inverse (32-bit)":
+                return ModbusDataConverter.ToLong(registers.AsSpan(i, registerSizePerItem), inverse: false).ToString();
+
+            case "Double (64-bit)":
+                return ModbusDataConverter.ToDouble(registers.AsSpan(i, registerSizePerItem), inverse: true).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            case "Double Inverse (64-bit)":
+                return ModbusDataConverter.ToDouble(registers.AsSpan(i, registerSizePerItem), inverse: false).ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            default: return registers[i].ToString();
+        }
+    }
+
+    /// <summary>
+    /// İlk okuma (veya layout değişikliği) durumunda TÜM değerleri, seçili veri tipine göre
+    /// çözümleyip [Adres: Değer] formatında listeler.
+    /// </summary>
+    string BuildFullChangeLog(ushort[] registers, ushort startAddress, string dataType, int registerSizePerItem)
     {
         var sb = new StringBuilder();
 
-        for (int i = 0; i < registers.Length; i++)
+        for (int i = 0; i < registers.Length; i += registerSizePerItem)
         {
-            ushort actualAddress = (ushort)(startAddress + i);
-            sb.Append($"[{actualAddress}: {registers[i]}] ");
+            ushort itemAddress = (ushort)(startAddress + i);
+            string value = GetRegisterDisplayValue(registers, dataType, i, registerSizePerItem);
+            sb.Append('[').Append(itemAddress).Append(": ").Append(value).Append("] ");
         }
 
         return sb.ToString().TrimEnd();
     }
 
-    string? BuildDiffChangeLog(ushort[] oldRegisters, ushort[] newRegisters, ushort startAddress)
+    /// <summary>
+    /// Önceki okuma ile şimdiki okumayı BLOK BAZINDA (registerSizePerItem adımlarla) karşılaştırır;
+    /// yalnızca gerçekten değişen blokları [Adres: EskiDeğer -> YeniDeğer] formatında filtreler.
+    /// Hiçbir blok değişmediyse null döner.
+    /// </summary>
+    string? BuildDiffChangeLog(ushort[] oldRegisters, ushort[] newRegisters, ushort startAddress, string dataType, int registerSizePerItem)
     {
         var sb = new StringBuilder();
         bool anyChanged = false;
 
-        for (int i = 0; i < newRegisters.Length; i++)
+        for (int i = 0; i < newRegisters.Length; i += registerSizePerItem)
         {
-            if (oldRegisters[i] != newRegisters[i])
+            // Bloktaki ham register'lar değişti mi diye Span üzerinden, allocation'sız karşılaştırıyoruz.
+            ReadOnlySpan<ushort> oldSlice = oldRegisters.AsSpan(i, registerSizePerItem);
+            ReadOnlySpan<ushort> newSlice = newRegisters.AsSpan(i, registerSizePerItem);
+
+            if (!oldSlice.SequenceEqual(newSlice))
             {
                 anyChanged = true;
-                ushort actualAddress = (ushort)(startAddress + i);
-                sb.Append($"[{actualAddress}: {oldRegisters[i]} -> {newRegisters[i]}] ");
+                ushort itemAddress = (ushort)(startAddress + i);
+                string oldValue = GetRegisterDisplayValue(oldRegisters, dataType, i, registerSizePerItem);
+                string newValue = GetRegisterDisplayValue(newRegisters, dataType, i, registerSizePerItem);
+                sb.Append('[').Append(itemAddress).Append(": ").Append(oldValue).Append(" -> ").Append(newValue).Append("] ");
             }
         }
 
@@ -290,17 +404,7 @@ using ModbusTester.Core.Exceptions;
             }
             catch (Exception ex)
             {
-                // Kapanış sinyali zaten verildiyse, beklenmedik bir soket hatasının bu genel bloğa
-                // düşüp anlamsız loglar basmasını engelliyoruz; döngü temizce kırılır.
-                if (cts.Token.IsCancellationRequested) break;
-
-                string errorMessage = $"BEKLENMEYEN HATA: {ex.Message}";
-
-                if (lastLoggedError != errorMessage)
-                {
-                    Log(errorMessage, ConsoleColor.Red);
-                    lastLoggedError = errorMessage;
-                }            
+                Log($"Deneme {attempt} başarısız: {ex.Message}", ConsoleColor.DarkYellow);
             }
         }
 
