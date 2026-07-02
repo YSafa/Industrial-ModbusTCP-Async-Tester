@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.VisualBasic;
 using ModbusTester.Core;
 using ModbusTester.Core.Core;
 using ModbusTester.Core.Exceptions;
@@ -12,15 +14,14 @@ namespace ModbusTester
 {
     public partial class MainForm : Form
     {
-        private ModbusClient? _modbusClient;
-        private CancellationTokenSource? _pollingCts;
-        private Task? _pollingTask;
-        
-        
-        // Fonksiyon kodu ComboBox öğelerini (görünen ad ↔ enum) eşleştiren liste.
-        // Bu sayede ComboBox'ta boşluklu okunabilir isimler gösterilebilir ve
-        // arka planda enum değerine karışıklık yaşanmadan erişilebilir.
-        private readonly System.Collections.Generic.List<(string Display, ModbusFunctionCode Code)> _functionCodeItems = new()
+        // Açık her sekmenin bağımsız durumunu (client, polling görevi, kontroller) tutan liste.
+        private readonly List<TabSession> _sessions = new();
+
+        // Dinamik sekmelere isim önerisi üretmek için sayaç.
+        private int _dynamicTabCounter = 1;
+
+        // Tüm sekmelerin ortak kullandığı fonksiyon kodu eşleme listesi (Display <-> enum).
+        private readonly List<(string Display, ModbusFunctionCode Code)> _functionCodeItems = new()
         {
             ("Read Coils (FC01)",             ModbusFunctionCode.ReadCoils),
             ("Read Discrete Inputs (FC02)",   ModbusFunctionCode.ReadDiscreteInputs),
@@ -28,44 +29,187 @@ namespace ModbusTester
             ("Read Input Registers (FC04)",   ModbusFunctionCode.ReadInputRegisters),
         };
 
-        private ushort[]? _oldValues;
-        private bool[]? _oldBitValues; // FC01/FC02 için ayrı bir "önceki değer" hafızası.
-
-        private byte? _lastProtocolErrorCode = null;
-
-        // Genel (protokol dışı) hataların log spam'ini önlemek için son mesajı saklıyoruz.
-        // Başarılı okumada _lastProtocolErrorCode ile birlikte sıfırlanır.
-        private string? _lastGeneralErrorMessage = null;
-
-        // Otomatik yeniden bağlanma için sabitler.
-        private const int ReconnectMaxAttempts  = 5;
-        private const int ReconnectDelayMs      = 2000;
-        
-        private struct PollingParameters
-        {
-            public byte SlaveId;
-            public ushort StartAddress;
-            public string DataType;
-            public ModbusFunctionCode FunctionCode;
-            public int UserQuantity;
-            public int IntervalMs;
-        }
+        private const int ReconnectMaxAttempts = 5;
+        private const int ReconnectDelayMs     = 2000;
 
         public MainForm()
         {
             InitializeComponent();
-            InitializeComboBoxes();
+
+            // Uygulama açılışında kapatılamayan varsayılan "Ana Cihaz" sekmesi oluşturulur.
+            CreateAndAddSession("Ana Cihaz", closable: false);
         }
 
-        private void InitializeComboBoxes()
-        {
-            cmbFunctionCode.Items.Clear();
-            foreach (var item in _functionCodeItems)
-                cmbFunctionCode.Items.Add(item.Display);
-            cmbFunctionCode.SelectedIndex = 2; // Varsayılan: Read Holding Registers (FC03)
+        // ---------------------------------------------------------
+        // YENİ SEKME EKLEME
+        // ---------------------------------------------------------
 
-            cmbDataType.Items.Clear();
-            cmbDataType.Items.AddRange(new object[]
+        private void BtnAddTab_Click(object? sender, EventArgs e)
+        {
+            string tabName = Interaction.InputBox(
+                "Yeni sekme için bir isim girin:", "Sekme Adı", $"Cihaz {_dynamicTabCounter + 1}");
+
+            if (string.IsNullOrWhiteSpace(tabName)) return;
+
+            _dynamicTabCounter++;
+            CreateAndAddSession(tabName.Trim(), closable: true);
+        }
+
+        private void CreateAndAddSession(string tabName, bool closable)
+        {
+            TabSession session = BuildSession(tabName, closable);
+            _sessions.Add(session);
+
+            tabControl.TabPages.Add(session.Page);
+            tabControl.SelectedTab = session.Page;
+        }
+
+        // ---------------------------------------------------------
+        // SEKME İÇİ UI İNŞASI (Orijinal Düzenin Birebir Klonu)
+        // ---------------------------------------------------------
+
+        private TabSession BuildSession(string tabName, bool closable)
+        {
+            var page = new TabPage(tabName);
+            var session = new TabSession(page);
+
+            // --- IP / Port ---
+            var lblIp = new Label { Text = "IP Adresi:", Location = new Point(12, 15), AutoSize = true };
+            session.TxtIp = new TextBox { Location = new Point(130, 12), Size = new Size(150, 20), Text = "127.0.0.1" };
+
+            var lblPort = new Label { Text = "Port:", Location = new Point(12, 45), AutoSize = true };
+            session.TxtPort = new TextBox { Location = new Point(130, 42), Size = new Size(80, 20), Text = "502" };
+
+            // --- Slave ID ---
+            var lblSlaveId = new Label { Text = "Slave ID:", Location = new Point(12, 75), AutoSize = true };
+            session.NumSlaveId = new NumericUpDown
+            {
+                Location = new Point(130, 72), Size = new Size(80, 20), Minimum = 1, Maximum = 255, Value = 1
+            };
+
+            // --- Başlangıç Adresi ---
+            var lblStartAddress = new Label { Text = "Başlangıç Adresi:", Location = new Point(12, 105), AutoSize = true };
+            session.NumStartAddress = new NumericUpDown
+            {
+                Location = new Point(130, 102), Size = new Size(80, 20), Minimum = 0, Maximum = 65535, Value = 0
+            };
+
+            // --- Fonksiyon Kodu ---
+            var lblFunctionCode = new Label { Text = "Fonksiyon Kodu:", Location = new Point(12, 135), AutoSize = true };
+            session.CmbFunctionCode = new ComboBox
+            {
+                Location = new Point(130, 132), Size = new Size(220, 21), DropDownStyle = ComboBoxStyle.DropDownList
+            };
+
+            // --- Veri Tipi ---
+            var lblDataType = new Label { Text = "Veri Tipi:", Location = new Point(12, 165), AutoSize = true };
+            session.CmbDataType = new ComboBox
+            {
+                Location = new Point(130, 162), Size = new Size(220, 21), DropDownStyle = ComboBoxStyle.DropDownList
+            };
+
+            // --- Adet ---
+            var lblQuantity = new Label { Text = "Adet:", Location = new Point(12, 195), AutoSize = true };
+            session.NumQuantity = new NumericUpDown
+            {
+                Location = new Point(130, 192), Size = new Size(80, 20), Minimum = 1, Maximum = 500, Value = 1
+            };
+
+            // --- Sorgulama Hızı ---
+            var lblPollingInterval = new Label { Text = "Sorgulama (ms):", Location = new Point(12, 225), AutoSize = true };
+            session.NumPollingInterval = new NumericUpDown
+            {
+                Location = new Point(130, 222), Size = new Size(80, 20), Minimum = 50, Maximum = 60000, Value = 200
+            };
+
+            // --- Bağlan / Durdur ---
+            session.BtnConnect = new Button
+            {
+                Text = "Bağlan", Location = new Point(130, 255), Size = new Size(90, 28), UseVisualStyleBackColor = true
+            };
+            session.BtnConnect.Click += (s, e) => BtnConnect_Click(session);
+
+            session.BtnStop = new Button
+            {
+                Text = "Durdur", Location = new Point(228, 255), Size = new Size(90, 28),
+                UseVisualStyleBackColor = true, Enabled = false
+            };
+            session.BtnStop.Click += (s, e) => BtnStop_Click(session);
+
+            // --- DataGridView ---
+            var colAddress = new DataGridViewTextBoxColumn { HeaderText = "Adres", Name = "colAddress", ReadOnly = true };
+            var colValue   = new DataGridViewTextBoxColumn { HeaderText = "Değer", Name = "colValue", ReadOnly = true };
+
+            session.Dgv = new DataGridView
+            {
+                Location = new Point(12, 295),
+                Size = new Size(440, 220),
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                ReadOnly = true,
+                RowHeadersVisible = false,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+            };
+            session.Dgv.Columns.AddRange(colAddress, colValue);
+            session.Dgv.CellDoubleClick += (s, e) => DgvRegisters_CellDoubleClick(session, e);
+
+            // --- Terminal / Log ---
+            session.RtbLogs = new RichTextBox
+            {
+                Location = new Point(12, 525),
+                Size = new Size(440, 150),
+                BackColor = Color.Black,
+                ForeColor = Color.White,
+                ReadOnly = true
+            };
+
+            page.Controls.Add(lblIp);
+            page.Controls.Add(session.TxtIp);
+            page.Controls.Add(lblPort);
+            page.Controls.Add(session.TxtPort);
+            page.Controls.Add(lblSlaveId);
+            page.Controls.Add(session.NumSlaveId);
+            page.Controls.Add(lblStartAddress);
+            page.Controls.Add(session.NumStartAddress);
+            page.Controls.Add(lblFunctionCode);
+            page.Controls.Add(session.CmbFunctionCode);
+            page.Controls.Add(lblDataType);
+            page.Controls.Add(session.CmbDataType);
+            page.Controls.Add(lblQuantity);
+            page.Controls.Add(session.NumQuantity);
+            page.Controls.Add(lblPollingInterval);
+            page.Controls.Add(session.NumPollingInterval);
+            page.Controls.Add(session.BtnConnect);
+            page.Controls.Add(session.BtnStop);
+            page.Controls.Add(session.Dgv);
+            page.Controls.Add(session.RtbLogs);
+
+            // Yalnızca dinamik eklenen sekmelerde "Sekmeyi Kapat" butonu bulunur.
+            if (closable)
+            {
+                session.BtnCloseTab = new Button
+                {
+                    Text = "Sekmeyi Kapat", Location = new Point(326, 255), Size = new Size(120, 28),
+                    UseVisualStyleBackColor = true
+                };
+                session.BtnCloseTab.Click += (s, e) => CloseSession(session);
+                page.Controls.Add(session.BtnCloseTab);
+            }
+
+            InitializeComboBoxes(session);
+
+            return session;
+        }
+
+        private void InitializeComboBoxes(TabSession session)
+        {
+            session.CmbFunctionCode.Items.Clear();
+            foreach (var item in _functionCodeItems)
+                session.CmbFunctionCode.Items.Add(item.Display);
+            session.CmbFunctionCode.SelectedIndex = 2; // Varsayılan: Read Holding Registers (FC03)
+
+            session.CmbDataType.Items.Clear();
+            session.CmbDataType.Items.AddRange(new object[]
             {
                 "Unsigned (16-bit)",
                 "Signed (16-bit)",
@@ -78,336 +222,293 @@ namespace ModbusTester
                 "Double (64-bit)",
                 "Double Inverse (64-bit)"
             });
-            cmbDataType.SelectedIndex = 0;
+            session.CmbDataType.SelectedIndex = 0;
 
-            numPollingInterval.Value = 200;
-            numQuantity.Value        = 1;
-            numQuantity.Minimum      = 1;
-            numQuantity.Maximum      = 500;
-
-            cmbFunctionCode.SelectedIndexChanged += CmbFunctionCode_SelectedIndexChanged;
+            session.CmbFunctionCode.SelectedIndexChanged += (s, e) => CmbFunctionCode_SelectedIndexChanged(session);
         }
-        
-        /// <summary>
-        /// Seçili ComboBox öğesini, _functionCodeItems listesi üzerinden güvenle ModbusFunctionCode'a çevirir.
-        /// </summary>
-        private ModbusFunctionCode GetSelectedFunctionCode()
+
+        private ModbusFunctionCode GetSelectedFunctionCode(TabSession session)
         {
-            int idx = cmbFunctionCode.SelectedIndex;
+            int idx = session.CmbFunctionCode.SelectedIndex;
             return (idx >= 0 && idx < _functionCodeItems.Count)
                 ? _functionCodeItems[idx].Code
                 : ModbusFunctionCode.ReadHoldingRegisters;
         }
 
-        /// <summary>
-        /// FC01/FC02 (bit tabanlı) seçildiğinde Veri Tipi alanı anlamsız kaldığı için pasif hale getirilir
-        /// ve sabit "Boolean (0/1)" gösterimine geçilir; FC03/FC04 seçilince tekrar aktif olur.
-        /// </summary>
-        private void CmbFunctionCode_SelectedIndexChanged(object? sender, EventArgs e)
+        private void CmbFunctionCode_SelectedIndexChanged(TabSession session)
         {
-            var selectedFc = GetSelectedFunctionCode();
-            bool isBitBased = selectedFc == ModbusFunctionCode.ReadCoils ||
-                              selectedFc == ModbusFunctionCode.ReadDiscreteInputs;
-            cmbDataType.Enabled = !isBitBased;
+            var fc = GetSelectedFunctionCode(session);
+            bool isBitBased = fc == ModbusFunctionCode.ReadCoils || fc == ModbusFunctionCode.ReadDiscreteInputs;
+            session.CmbDataType.Enabled = !isBitBased;
         }
 
         // ---------------------------------------------------------
-        // BAĞLAN / DURDUR BUTONLARI (Değişmedi)
+        // BAĞLAN / DURDUR (Sekme Bazlı)
         // ---------------------------------------------------------
 
-        private async void btnConnect_Click(object sender, EventArgs e)
+        private async void BtnConnect_Click(TabSession session)
         {
-            if (_modbusClient != null && _modbusClient.IsConnected)
+            if (session.Client != null && session.Client.IsConnected)
             {
-                LogMessage("Zaten bağlı durumdasınız.", Color.Orange);
+                LogMessage(session, "Zaten bağlı durumdasınız.", Color.Orange);
                 return;
             }
 
-            string ip = txtIpAddress.Text.Trim();
+            string ip = session.TxtIp.Text.Trim();
             if (string.IsNullOrWhiteSpace(ip))
             {
-                LogMessage("IP adresi boş olamaz.", Color.Red);
+                LogMessage(session, "IP adresi boş olamaz.", Color.Red);
                 return;
             }
 
-            if (!int.TryParse(txtPort.Text.Trim(), out int port) || port <= 0 || port > 65535)
+            if (!int.TryParse(session.TxtPort.Text.Trim(), out int port) || port <= 0 || port > 65535)
             {
-                LogMessage("Geçersiz port numarası.", Color.Red);
+                LogMessage(session, "Geçersiz port numarası.", Color.Red);
                 return;
             }
 
-            btnConnect.Enabled = false;
+            session.BtnConnect.Enabled = false;
 
             try
             {
-                _modbusClient = new ModbusClient(ip, port)
-                {
-                    ConnectTimeoutMs = 3000,
-                    IoTimeoutMs = 3000
-                };
+                session.Client = new ModbusClient(ip, port) { ConnectTimeoutMs = 3000, IoTimeoutMs = 3000 };
 
-                LogMessage($"'{ip}:{port}' adresine bağlanılıyor...", Color.Gray);
+                LogMessage(session, $"'{ip}:{port}' adresine bağlanılıyor...", Color.Gray);
+                await session.Client.ConnectAsync();
+                LogMessage(session, "Bağlantı başarılı.", Color.Green);
 
-                await _modbusClient.ConnectAsync();
+                // Yalnızca IP/Port/SlaveId kilitlenir. StartAddress, Quantity, DataType, FunctionCode
+                // ve PollingInterval bağlantı canlıyken bile Hot-Reload ile serbest kalır.
+                SetConnectionControlsEnabled(session, false);
 
-                LogMessage("Bağlantı başarılı.", Color.Green);
+                session.OldValues = null;
+                session.OldBitValues = null;
 
-                SetParameterControlsEnabled(false);
-                
-                _oldValues = null;
-                _oldBitValues = null;
-                
-                StartPolling();
-                btnStop.Enabled = true;
+                StartPolling(session);
+                session.BtnStop.Enabled = true;
             }
-            catch (ModbusConnectionException ex)
-            {
-                LogMessage($"BAĞLANTI HATASI: {ex.Message}", Color.Red);
-            }
-            catch (ModbusTimeoutException ex)
-            {
-                LogMessage($"BAĞLANTI ZAMAN AŞIMI: {ex.Message}", Color.Red);
-            }
-            catch (Exception ex)
-            {
-                LogMessage($"Beklenmeyen hata: {ex.Message}", Color.Red);
-            }
-            finally
-            {
-                btnConnect.Enabled = true;
-            }
+            catch (ModbusConnectionException ex) { LogMessage(session, $"BAĞLANTI HATASI: {ex.Message}", Color.Red); }
+            catch (ModbusTimeoutException ex)    { LogMessage(session, $"BAĞLANTI ZAMAN AŞIMI: {ex.Message}", Color.Red); }
+            catch (Exception ex)                 { LogMessage(session, $"Beklenmeyen hata: {ex.Message}", Color.Red); }
+            finally { session.BtnConnect.Enabled = true; }
         }
 
-        private void btnStop_Click(object sender, EventArgs e)
+        private void BtnStop_Click(TabSession session)
         {
-            StopPolling();
-
-            _modbusClient?.Disconnect();
-            LogMessage("Bağlantı kesildi, polling durduruldu.", Color.Orange);
-
-            SetParameterControlsEnabled(true);
-
-            btnStop.Enabled = false;
+            StopPolling(session);
+            session.Client?.Disconnect();
+            LogMessage(session, "Bağlantı kesildi, polling durduruldu.", Color.Orange);
+            SetConnectionControlsEnabled(session, true);
+            session.BtnStop.Enabled = false;
         }
 
-        private void SetParameterControlsEnabled(bool enabled)
+        /// <summary>
+        /// Yalnızca IP, Port ve Slave ID kilitler/açar. Diğer tüm parametreler bağlantı durumundan
+        /// bağımsız olarak her zaman düzenlenebilir kalır (Hot-Reload gereksinimi).
+        /// </summary>
+        private void SetConnectionControlsEnabled(TabSession session, bool enabled)
         {
             if (this.InvokeRequired)
             {
-                this.Invoke(new Action(() => SetParameterControlsEnabled(enabled)));
+                this.Invoke(new Action(() => SetConnectionControlsEnabled(session, enabled)));
                 return;
             }
 
-            txtIpAddress.Enabled      = enabled;
-            txtPort.Enabled           = enabled;
-            numSlaveId.Enabled        = enabled;
-            numStartAddress.Enabled   = enabled;
-            numQuantity.Enabled       = enabled;
-            numPollingInterval.Enabled = enabled;
-            cmbFunctionCode.Enabled   = enabled;
-
-            // Bit tabanlı fonksiyon seçiliyken cmbDataType zaten pasifti; bu durumu koruyoruz.
-            var fc       = GetSelectedFunctionCode();
-            bool bitMode = fc == ModbusFunctionCode.ReadCoils || fc == ModbusFunctionCode.ReadDiscreteInputs;
-            cmbDataType.Enabled = enabled && !bitMode;
+            session.TxtIp.Enabled = enabled;
+            session.TxtPort.Enabled = enabled;
+            session.NumSlaveId.Enabled = enabled;
         }
 
         // ---------------------------------------------------------
-        // POLLING DÖNGÜSÜ
+        // POLLING DÖNGÜSÜ (PeriodicTimer, Hot-Reload destekli)
         // ---------------------------------------------------------
 
-        private void StartPolling()
+        private void StartPolling(TabSession session)
         {
-            StopPolling();
-
-            _pollingCts = new CancellationTokenSource();
-            var token = _pollingCts.Token;
-
-            _pollingTask = Task.Run(() => PollingLoopAsync(token), token);
+            StopPolling(session);
+            session.PollingCts = new CancellationTokenSource();
+            var token = session.PollingCts.Token;
+            session.PollingTask = Task.Run(() => PollingLoopAsync(session, token), token);
         }
 
-        private void StopPolling()
+        private void StopPolling(TabSession session)
         {
-            _pollingCts?.Cancel();
-            _pollingCts?.Dispose();
-            _pollingCts = null;
+            session.PollingCts?.Cancel();
+            session.PollingCts?.Dispose();
+            session.PollingCts = null;
+            session.Timer?.Dispose();
+            session.Timer = null;
         }
 
-        private async Task PollingLoopAsync(CancellationToken token)
+        private async Task PollingLoopAsync(TabSession session, CancellationToken token)
         {
+            // İlk PeriodicTimer, o anki polling aralığıyla kuruluyor.
+            PollingParameters initial = GetPollingParametersSafe(session);
+            session.CurrentIntervalMs = Math.Max(50, initial.IntervalMs);
+            session.Timer = new PeriodicTimer(TimeSpan.FromMilliseconds(session.CurrentIntervalMs));
+
             while (!token.IsCancellationRequested)
             {
-                PollingParameters parameters = GetPollingParametersSafe();
+                PollingParameters parameters = GetPollingParametersSafe(session);
 
                 try
                 {
-                    await ReadAndDisplayAsync(parameters);
-
-                    // Başarılı okumada her iki hata hafızasını da sıfırla;
-                    // sistem düzelince aynı hata yeniden gelirse bir kez daha loglanabilsin.
-                    _lastProtocolErrorCode  = null;
-                    _lastGeneralErrorMessage = null;
+                    await ReadAndDisplayAsync(session, parameters);
+                    session.LastProtocolErrorCode = null;
+                    session.LastGeneralErrorMessage = null;
                 }
                 catch (ModbusProtocolException ex)
                 {
-                    // Protokol hatası: bağlantı sağlam, sadece slave mantıksal hata bildirdi.
-                    // Aynı hata kodu tekrar ediyorsa log ekranını kirletmiyoruz.
-                    if (_lastProtocolErrorCode == null || _lastProtocolErrorCode.Value != ex.ExceptionCode)
+                    if (session.LastProtocolErrorCode == null || session.LastProtocolErrorCode.Value != ex.ExceptionCode)
                     {
-                        LogMessage($"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}", Color.Red);
-                        _lastProtocolErrorCode = ex.ExceptionCode;
+                        LogMessage(session, $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}", Color.Red);
+                        session.LastProtocolErrorCode = ex.ExceptionCode;
                     }
-
-                    ClearGridSafe();
+                    ClearGridSafe(session);
                 }
                 catch (ModbusTimeoutException ex)
                 {
-                    // Fiziksel bağlantı kopması: döngüyü kırmak yerine yeniden bağlanmayı deniyoruz.
-                    LogMessage($"ZAMAN AŞIMI: {ex.Message}", Color.Red);
-                    ClearGridSafe();
+                    LogMessage(session, $"ZAMAN AŞIMI: {ex.Message}", Color.Red);
+                    ClearGridSafe(session);
 
-                    bool reconnected = await TryReconnectAsync(token);
+                    bool reconnected = await TryReconnectAsync(session, token);
                     if (!reconnected)
                     {
-                        // 5 deneme sonunda da bağlanamazsak döngüyü kırıp arayüzü serbest bırakıyoruz.
-                        SetParameterControlsEnabled(true);
-                        SetConnectionButtonsAfterDrop();
+                        SetConnectionControlsEnabled(session, true);
+                        SetConnectionButtonsAfterDrop(session);
                         break;
                     }
 
-                    // Başarıyla yeniden bağlandıysak önbelleği temizleyip kaldığımız yerden devam ediyoruz.
-                    _lastProtocolErrorCode   = null;
-                    _lastGeneralErrorMessage = null;
-                    _oldValues               = null;
-                    _oldBitValues            = null;
+                    session.LastProtocolErrorCode = null;
+                    session.LastGeneralErrorMessage = null;
+                    session.OldValues = null;
+                    session.OldBitValues = null;
                     continue;
                 }
                 catch (ModbusConnectionException ex)
                 {
-                    LogMessage($"BAĞLANTI HATASI: {ex.Message}", Color.Red);
-                    ClearGridSafe();
+                    LogMessage(session, $"BAĞLANTI HATASI: {ex.Message}", Color.Red);
+                    ClearGridSafe(session);
 
-                    bool reconnected = await TryReconnectAsync(token);
+                    bool reconnected = await TryReconnectAsync(session, token);
                     if (!reconnected)
                     {
-                        SetParameterControlsEnabled(true);
-                        SetConnectionButtonsAfterDrop();
+                        SetConnectionControlsEnabled(session, true);
+                        SetConnectionButtonsAfterDrop(session);
                         break;
                     }
 
-                    _lastProtocolErrorCode   = null;
-                    _lastGeneralErrorMessage = null;
-                    _oldValues               = null;
-                    _oldBitValues            = null;
+                    session.LastProtocolErrorCode = null;
+                    session.LastGeneralErrorMessage = null;
+                    session.OldValues = null;
+                    session.OldBitValues = null;
                     continue;
                 }
                 catch (Exception ex)
                 {
-                    // Yerel C# istisnaları (ör: ArgumentOutOfRangeException - adet sınırı aşıldı).
-                    // Aynı mesaj art arda tekrar ediyorsa log ekranına yalnızca 1 kez basıyoruz.
-                    if (_lastGeneralErrorMessage == null || _lastGeneralErrorMessage != ex.Message)
+                    if (session.LastGeneralErrorMessage == null || session.LastGeneralErrorMessage != ex.Message)
                     {
-                        LogMessage($"HATA: {ex.Message}", Color.Red);
-                        _lastGeneralErrorMessage = ex.Message;
+                        LogMessage(session, $"HATA: {ex.Message}", Color.Red);
+                        session.LastGeneralErrorMessage = ex.Message;
                     }
+                    ClearGridSafe(session);
+                }
 
-                    ClearGridSafe();
+                // Sorgulama aralığı runtime'da değiştiyse (Hot-Reload), eski timer dispose edilip
+                // yeni süreyle yeniden oluşturuluyor.
+                if (parameters.IntervalMs != session.CurrentIntervalMs && parameters.IntervalMs > 0)
+                {
+                    session.Timer?.Dispose();
+                    session.Timer = new PeriodicTimer(TimeSpan.FromMilliseconds(parameters.IntervalMs));
+                    session.CurrentIntervalMs = parameters.IntervalMs;
                 }
 
                 try
                 {
-                    await Task.Delay(parameters.IntervalMs, token);
+                    if (session.Timer == null) break;
+                    if (!await session.Timer.WaitForNextTickAsync(token)) break;
                 }
-                catch (TaskCanceledException)
+                catch (OperationCanceledException)
                 {
                     break;
                 }
             }
+
+            session.Timer?.Dispose();
+            session.Timer = null;
         }
 
         /// <summary>
-        /// Bağlantı koptuğunda maksimum <see cref="ReconnectMaxAttempts"/> kez yeniden bağlanmayı dener.
-        /// Her denemede log ekranına sarı renkli bilgi mesajı basar.
-        /// Başarıda true, tüm denemeler tükenince false döner.
+        /// Bağlantı koptuğunda maksimum ReconnectMaxAttempts kez yeniden bağlanmayı dener.
         /// </summary>
-        private async Task<bool> TryReconnectAsync(CancellationToken token)
+        private async Task<bool> TryReconnectAsync(TabSession session, CancellationToken token)
         {
-            if (_modbusClient == null) return false;
+            if (session.Client == null) return false;
 
             for (int attempt = 1; attempt <= ReconnectMaxAttempts; attempt++)
             {
                 if (token.IsCancellationRequested) return false;
 
-                LogMessage($"Yeniden bağlanılıyor... Deneme {attempt}/{ReconnectMaxAttempts}", Color.Yellow);
+                LogMessage(session, $"Yeniden bağlanılıyor... Deneme {attempt}/{ReconnectMaxAttempts}", Color.Yellow);
 
                 try
                 {
                     await Task.Delay(ReconnectDelayMs, token);
-                    await _modbusClient.ConnectAsync();
+                    await session.Client.ConnectAsync();
 
-                    LogMessage("Yeniden bağlantı başarılı, polling devam ediyor.", Color.Green);
+                    LogMessage(session, "Yeniden bağlantı başarılı, polling devam ediyor.", Color.Green);
                     return true;
                 }
-                catch (TaskCanceledException)
-                {
-                    // Kullanıcı Durdur butonuna bastı; sessizce çıkıyoruz.
-                    return false;
-                }
-                catch (Exception ex)
-                {
-                    // Bu deneme başarısız; bir sonraki turda tekrar denenecek.
-                    LogMessage($"Deneme {attempt} başarısız: {ex.Message}", Color.OrangeRed);
-                }
+                catch (TaskCanceledException) { return false; }
+                catch (Exception ex) { LogMessage(session, $"Deneme {attempt} başarısız: {ex.Message}", Color.OrangeRed); }
             }
 
-            LogMessage($"{ReconnectMaxAttempts} deneme sonunda bağlantı kurulamadı. Lütfen manuel olarak yeniden bağlanın.", Color.Red);
+            LogMessage(session, $"{ReconnectMaxAttempts} deneme sonunda bağlantı kurulamadı. Lütfen manuel olarak yeniden bağlanın.", Color.Red);
             return false;
         }
 
-        private void SetConnectionButtonsAfterDrop()
+        private void SetConnectionButtonsAfterDrop(TabSession session)
         {
             if (this.InvokeRequired)
             {
-                this.Invoke(new Action(SetConnectionButtonsAfterDrop));
+                this.Invoke(new Action(() => SetConnectionButtonsAfterDrop(session)));
                 return;
             }
 
-            btnConnect.Enabled = true;
-            btnStop.Enabled = false;
+            session.BtnConnect.Enabled = true;
+            session.BtnStop.Enabled = false;
         }
 
-        private void ClearGridSafe()
+        private void ClearGridSafe(TabSession session)
         {
             if (this.InvokeRequired)
             {
-                this.Invoke(new Action(ClearGridSafe));
+                this.Invoke(new Action(() => ClearGridSafe(session)));
                 return;
             }
 
-            dgvRegisters.Rows.Clear();
-            _oldValues = null;
-            _oldBitValues = null;
+            session.Dgv.Rows.Clear();
+            session.OldValues = null;
+            session.OldBitValues = null;
         }
 
-        private PollingParameters GetPollingParametersSafe()
+        private PollingParameters GetPollingParametersSafe(TabSession session)
         {
             if (this.InvokeRequired)
-            {
-                return (PollingParameters)this.Invoke(new Func<PollingParameters>(ReadPollingParametersFromUi));
-            }
-            return ReadPollingParametersFromUi();
+                return (PollingParameters)this.Invoke(new Func<PollingParameters>(() => ReadPollingParametersFromUi(session)));
+            return ReadPollingParametersFromUi(session);
         }
 
-        private PollingParameters ReadPollingParametersFromUi()
+        private PollingParameters ReadPollingParametersFromUi(TabSession session)
         {
             return new PollingParameters
             {
-                SlaveId      = (byte)numSlaveId.Value,
-                StartAddress = (ushort)numStartAddress.Value,
-                DataType     = cmbDataType.SelectedItem?.ToString() ?? "Unsigned (16-bit)",
-                FunctionCode = GetSelectedFunctionCode(), // Artık enum'a güvenle eşleniyor.
-                UserQuantity = (int)numQuantity.Value,
-                IntervalMs   = (int)numPollingInterval.Value
+                SlaveId      = (byte)session.NumSlaveId.Value,
+                StartAddress = (ushort)session.NumStartAddress.Value,
+                DataType     = session.CmbDataType.SelectedItem?.ToString() ?? "Unsigned (16-bit)",
+                FunctionCode = GetSelectedFunctionCode(session),
+                UserQuantity = (int)session.NumQuantity.Value,
+                IntervalMs   = (int)session.NumPollingInterval.Value
             };
         }
 
@@ -415,87 +516,61 @@ namespace ModbusTester
         // OKUMA + EKRANA YANSITMA
         // ---------------------------------------------------------
 
-        private async Task ReadAndDisplayAsync(PollingParameters parameters)
+        private async Task ReadAndDisplayAsync(TabSession session, PollingParameters parameters)
         {
-            // Seçilen fonksiyon koduna göre bit tabanlı mı (FC01/FC02) yoksa register tabanlı mı (FC03/FC04) ayrıştırıyoruz.
             bool isBitBased = parameters.FunctionCode == ModbusFunctionCode.ReadCoils ||
                                parameters.FunctionCode == ModbusFunctionCode.ReadDiscreteInputs;
 
-            if (isBitBased)
-            {
-                await ReadAndDisplayBitsAsync(parameters);
-            }
-            else
-            {
-                await ReadAndDisplayRegistersAsync(parameters);
-            }
+            if (isBitBased) await ReadAndDisplayBitsAsync(session, parameters);
+            else             await ReadAndDisplayRegistersAsync(session, parameters);
         }
 
-        /// <summary>
-        /// FC01 (Read Coils) ve FC02 (Read Discrete Inputs) için okuma ve ekrana yansıtma akışı.
-        /// </summary>
-        private async Task ReadAndDisplayBitsAsync(PollingParameters parameters)
+        private async Task ReadAndDisplayBitsAsync(TabSession session, PollingParameters parameters)
         {
             if (parameters.UserQuantity > 2000)
-            {
-                throw new ArgumentOutOfRangeException(
-                    nameof(parameters.UserQuantity), "Bit miktarı 2000'i aşıyor.");
-            }
+                throw new ArgumentOutOfRangeException(nameof(parameters.UserQuantity), "Bit miktarı 2000'i aşıyor.");
 
-            if (_modbusClient == null) return;
-            
+            if (session.Client == null) return;
+
             bool[] bits = parameters.FunctionCode == ModbusFunctionCode.ReadCoils
-                ? await _modbusClient.ReadCoilsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity)
-                : await _modbusClient.ReadDiscreteInputsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity);
+                ? await session.Client.ReadCoilsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity)
+                : await session.Client.ReadDiscreteInputsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity);
 
-            _lastProtocolErrorCode = null;
+            session.LastProtocolErrorCode = null;
 
-            bool hasChanged = HasBitValuesChanged(_oldBitValues, bits);
-
+            bool hasChanged = HasBitValuesChanged(session.OldBitValues, bits);
             if (hasChanged)
             {
-                _oldBitValues = (bool[])bits.Clone();
-
+                session.OldBitValues = (bool[])bits.Clone();
                 this.Invoke(new Action(() =>
                 {
-                    LogMessage("Veri Değişti.", Color.Green);
-                    DisplayBitsInGrid(bits, parameters.StartAddress);
+                    LogMessage(session, "Veri Değişti.", Color.Green);
+                    DisplayBitsInGrid(session, bits, parameters.StartAddress);
                 }));
             }
         }
 
-        /// <summary>
-        /// FC03 (Read Holding Registers) ve FC04 (Read Input Registers) için okuma ve ekrana yansıtma akışı.
-        /// </summary>
-        private async Task ReadAndDisplayRegistersAsync(PollingParameters parameters)
+        private async Task ReadAndDisplayRegistersAsync(TabSession session, PollingParameters parameters)
         {
             int registerSizePerItem = GetRegisterSizeForDataType(parameters.DataType);
             int totalQuantity = parameters.UserQuantity * registerSizePerItem;
 
-            /*if (totalQuantity > 125)
-            {
-                throw new ArgumentOutOfRangeException(
-                    nameof(totalQuantity), "Toplam register sayısı 125'i aşıyor; adet veya veri tipini azaltın.");
-            }*/
+            if (session.Client == null) return;
 
-            if (_modbusClient == null) return;
-            
             ushort[] registers = parameters.FunctionCode == ModbusFunctionCode.ReadHoldingRegisters
-                ? await _modbusClient.ReadHoldingRegistersAsync(parameters.SlaveId, parameters.StartAddress, (ushort)totalQuantity)
-                : await _modbusClient.ReadInputRegistersAsync(parameters.SlaveId, parameters.StartAddress, (ushort)totalQuantity);
+                ? await session.Client.ReadHoldingRegistersAsync(parameters.SlaveId, parameters.StartAddress, (ushort)totalQuantity)
+                : await session.Client.ReadInputRegistersAsync(parameters.SlaveId, parameters.StartAddress, (ushort)totalQuantity);
 
-            _lastProtocolErrorCode = null;
+            session.LastProtocolErrorCode = null;
 
-            bool hasChanged = HasValuesChanged(_oldValues, registers);
-
+            bool hasChanged = HasValuesChanged(session.OldValues, registers);
             if (hasChanged)
             {
-                _oldValues = (ushort[])registers.Clone();
-
+                session.OldValues = (ushort[])registers.Clone();
                 this.Invoke(new Action(() =>
                 {
-                    LogMessage("Veri Değişti.", Color.Green);
-                    DisplayRegistersInGrid(registers, parameters.DataType, parameters.StartAddress, registerSizePerItem);
+                    LogMessage(session, "Veri Değişti.", Color.Green);
+                    DisplayRegistersInGrid(session, registers, parameters.DataType, parameters.StartAddress, registerSizePerItem);
                 }));
             }
         }
@@ -503,22 +578,14 @@ namespace ModbusTester
         private bool HasValuesChanged(ushort[]? oldValues, ushort[] newValues)
         {
             if (oldValues == null || oldValues.Length != newValues.Length) return true;
-
-            for (int i = 0; i < oldValues.Length; i++)
-            {
-                if (oldValues[i] != newValues[i]) return true;
-            }
+            for (int i = 0; i < oldValues.Length; i++) if (oldValues[i] != newValues[i]) return true;
             return false;
         }
 
         private bool HasBitValuesChanged(bool[]? oldValues, bool[] newValues)
         {
             if (oldValues == null || oldValues.Length != newValues.Length) return true;
-
-            for (int i = 0; i < oldValues.Length; i++)
-            {
-                if (oldValues[i] != newValues[i]) return true;
-            }
+            for (int i = 0; i < oldValues.Length; i++) if (oldValues[i] != newValues[i]) return true;
             return false;
         }
 
@@ -531,35 +598,27 @@ namespace ModbusTester
                 case "Long (32-bit)":
                 case "Long Inverse (32-bit)":
                     return 2;
-
                 case "Double (64-bit)":
                 case "Double Inverse (64-bit)":
                     return 4;
-
                 default:
                     return 1;
             }
         }
 
-        /// <summary>
-        /// FC01/FC02 sonucu gelen bool[] dizisini DataGridView'e "1"/"0" olarak satır satır basar.
-        /// </summary>
-        private void DisplayBitsInGrid(bool[] bits, ushort startAddress)
+        private void DisplayBitsInGrid(TabSession session, bool[] bits, ushort startAddress)
         {
-            dgvRegisters.Rows.Clear();
-
+            session.Dgv.Rows.Clear();
             for (int i = 0; i < bits.Length; i++)
             {
                 ushort itemAddress = (ushort)(startAddress + i);
-
-                // mbslave ve çoğu SCADA aracı bit durumlarını 1/0 olarak gösterir; okunabilirlik için bu formatı kullanıyoruz.
-                dgvRegisters.Rows.Add(itemAddress, bits[i] ? "1" : "0");
+                session.Dgv.Rows.Add(itemAddress, bits[i] ? "1" : "0");
             }
         }
 
-        private void DisplayRegistersInGrid(ushort[] registers, string dataType, ushort startAddress, int registerSizePerItem)
+        private void DisplayRegistersInGrid(TabSession session, ushort[] registers, string dataType, ushort startAddress, int registerSizePerItem)
         {
-            dgvRegisters.Rows.Clear();
+            session.Dgv.Rows.Clear();
 
             for (int i = 0; i < registers.Length; i += registerSizePerItem)
             {
@@ -568,69 +627,51 @@ namespace ModbusTester
                 switch (dataType)
                 {
                     case "Unsigned (16-bit)":
-                        dgvRegisters.Rows.Add(itemAddress, registers[i]);
+                        session.Dgv.Rows.Add(itemAddress, registers[i]);
                         break;
-
                     case "Signed (16-bit)":
-                        short signed = ModbusDataConverter.ToSigned(registers[i]);
-                        dgvRegisters.Rows.Add(itemAddress, signed);
+                        session.Dgv.Rows.Add(itemAddress, ModbusDataConverter.ToSigned(registers[i]));
                         break;
-
                     case "Hex":
-                        string hex = ModbusDataConverter.ToHex(registers[i]);
-                        dgvRegisters.Rows.Add(itemAddress, hex);
+                        session.Dgv.Rows.Add(itemAddress, ModbusDataConverter.ToHex(registers[i]));
                         break;
-
                     case "Binary":
-                        string binary = ModbusDataConverter.ToBinary(registers[i]);
-                        dgvRegisters.Rows.Add(itemAddress, binary);
+                        session.Dgv.Rows.Add(itemAddress, ModbusDataConverter.ToBinary(registers[i]));
                         break;
-
                     case "Float (32-bit)":
                     {
                         ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        float val = ModbusDataConverter.ToFloat(slice, inverse: true);
-                        dgvRegisters.Rows.Add($"{itemAddress}-{itemAddress + 1}", val);
+                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToFloat(slice, inverse: true));
                         break;
                     }
-
                     case "Float Inverse (32-bit)":
                     {
                         ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        float val = ModbusDataConverter.ToFloat(slice, inverse: false);
-                        dgvRegisters.Rows.Add($"{itemAddress}-{itemAddress + 1}", val);
+                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToFloat(slice, inverse: false));
                         break;
                     }
-
                     case "Long (32-bit)":
                     {
                         ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        int val = ModbusDataConverter.ToLong(slice, inverse: true);
-                        dgvRegisters.Rows.Add($"{itemAddress}-{itemAddress + 1}", val);
+                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToLong(slice, inverse: true));
                         break;
                     }
-
                     case "Long Inverse (32-bit)":
                     {
                         ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        int val = ModbusDataConverter.ToLong(slice, inverse: false);
-                        dgvRegisters.Rows.Add($"{itemAddress}-{itemAddress + 1}", val);
+                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 1}", ModbusDataConverter.ToLong(slice, inverse: false));
                         break;
                     }
-
                     case "Double (64-bit)":
                     {
                         ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        double val = ModbusDataConverter.ToDouble(slice, inverse: true);
-                        dgvRegisters.Rows.Add($"{itemAddress}-{itemAddress + 3}", val);
+                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 3}", ModbusDataConverter.ToDouble(slice, inverse: true));
                         break;
                     }
-
                     case "Double Inverse (64-bit)":
                     {
                         ushort[] slice = SliceRegisters(registers, i, registerSizePerItem);
-                        double val = ModbusDataConverter.ToDouble(slice, inverse: false);
-                        dgvRegisters.Rows.Add($"{itemAddress}-{itemAddress + 3}", val);
+                        session.Dgv.Rows.Add($"{itemAddress}-{itemAddress + 3}", ModbusDataConverter.ToDouble(slice, inverse: false));
                         break;
                     }
                 }
@@ -645,105 +686,158 @@ namespace ModbusTester
         }
 
         // ---------------------------------------------------------
-        // LOG YAZDIRMA
+        // LOG YAZDIRMA (Sekmeye Özel Terminal)
         // ---------------------------------------------------------
 
-        private void LogMessage(string message, Color color)
+        private void LogMessage(TabSession session, string message, Color color)
         {
-            if (rtbLogs.InvokeRequired)
-            {
-                rtbLogs.Invoke(new Action(() => AppendLog(message, color)));
-            }
+            if (session.RtbLogs.InvokeRequired)
+                session.RtbLogs.Invoke(new Action(() => AppendLog(session, message, color)));
             else
-            {
-                AppendLog(message, color);
-            }
+                AppendLog(session, message, color);
         }
 
-        private void AppendLog(string message, Color color)
+        private void AppendLog(TabSession session, string message, Color color)
         {
-            rtbLogs.SelectionStart = rtbLogs.TextLength;
-            rtbLogs.SelectionLength = 0;
-
-            rtbLogs.SelectionColor = color;
-            rtbLogs.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
-            rtbLogs.SelectionColor = rtbLogs.ForeColor;
-
-            rtbLogs.ScrollToCaret();
+            session.RtbLogs.SelectionStart = session.RtbLogs.TextLength;
+            session.RtbLogs.SelectionLength = 0;
+            session.RtbLogs.SelectionColor = color;
+            session.RtbLogs.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
+            session.RtbLogs.SelectionColor = session.RtbLogs.ForeColor;
+            session.RtbLogs.ScrollToCaret();
         }
 
         // ---------------------------------------------------------
-        // FORM KAPANIRKEN TEMİZLİK
+        // WriteForm ENTEGRASYONU (Çift Tıklama)
         // ---------------------------------------------------------
 
-        /// <summary>
-        /// DataGridView'de bir satıra çift tıklandığında WriteForm'u açar.
-        /// Tıklanan satırın adresi ve mevcut değeri otomatik olarak forma aktarılır.
-        /// </summary>
-        private void DgvRegisters_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+        private void DgvRegisters_CellDoubleClick(TabSession session, DataGridViewCellEventArgs e)
         {
             if (e.RowIndex < 0) return;
-            if (_modbusClient == null || !_modbusClient.IsConnected) return;
+            if (session.Client == null || !session.Client.IsConnected) return;
 
-            // UI thread'indeyiz, Invoke gerekmez.
-            var parameters = ReadPollingParametersFromUi();
+            var parameters = ReadPollingParametersFromUi(session);
 
-            bool isBitBased   = parameters.FunctionCode == ModbusFunctionCode.ReadCoils ||
+            bool isBitBased  = parameters.FunctionCode == ModbusFunctionCode.ReadCoils ||
                                 parameters.FunctionCode == ModbusFunctionCode.ReadDiscreteInputs;
-            int registerSize  = isBitBased ? 1 : GetRegisterSizeForDataType(parameters.DataType);
+            int registerSize = isBitBased ? 1 : GetRegisterSizeForDataType(parameters.DataType);
 
-            // Hücredeki adres değerini parse ediyoruz ("0", "0-1", "0-3" gibi formatlara karşı koruma).
-            string addrCell   = dgvRegisters.Rows[e.RowIndex].Cells[0].Value?.ToString() ?? "0";
-            string firstPart  = addrCell.Split('-')[0].Trim();
+            string addrCell  = session.Dgv.Rows[e.RowIndex].Cells[0].Value?.ToString() ?? "0";
+            string firstPart = addrCell.Split('-')[0].Trim();
             if (!ushort.TryParse(firstPart, out ushort itemAddress)) return;
 
-            // İlgili satırın ham register veya bit dilimini önceki okumadan alıyoruz.
             ushort[]? slice    = null;
             bool[]?   bitSlice = null;
-            int        rowIdx  = e.RowIndex;
+            int       rowIdx   = e.RowIndex;
 
             if (isBitBased)
             {
-                if (_oldBitValues != null && rowIdx < _oldBitValues.Length)
-                    bitSlice = new[] { _oldBitValues[rowIdx] };
+                if (session.OldBitValues != null && rowIdx < session.OldBitValues.Length)
+                    bitSlice = new[] { session.OldBitValues[rowIdx] };
             }
             else
             {
-                if (_oldValues != null)
+                if (session.OldValues != null)
                 {
                     int startIdx = rowIdx * registerSize;
-                    if (startIdx + registerSize <= _oldValues.Length)
+                    if (startIdx + registerSize <= session.OldValues.Length)
                     {
                         slice = new ushort[registerSize];
-                        Array.Copy(_oldValues, startIdx, slice, 0, registerSize);
+                        Array.Copy(session.OldValues, startIdx, slice, 0, registerSize);
                     }
                 }
             }
 
             using var writeForm = new WriteForm(
-                _modbusClient,
-                parameters.SlaveId,
-                itemAddress,
-                parameters.DataType,
-                parameters.FunctionCode,
-                slice,
-                bitSlice);
+                session.Client, parameters.SlaveId, itemAddress, parameters.DataType,
+                parameters.FunctionCode, slice, bitSlice);
 
-            // Başarılı yazma logu doğrudan MainForm'un log paneline düşer.
-            writeForm.OnSuccessLog = msg => LogMessage(msg, Color.Green);
+            writeForm.OnSuccessLog = msg => LogMessage(session, msg, Color.Green);
 
             if (writeForm.ShowDialog(this) == DialogResult.OK)
             {
-                // Yazma sonrası bir sonraki polling adımında tabloyu yenile.
-                _oldValues    = null;
-                _oldBitValues = null;
+                session.OldValues = null;
+                session.OldBitValues = null;
             }
         }
-        
-        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+
+        // ---------------------------------------------------------
+        // SEKME KAPATMA
+        // ---------------------------------------------------------
+
+        private void CloseSession(TabSession session)
         {
-            StopPolling();
-            _modbusClient?.Disconnect();
+            StopPolling(session);
+            session.Client?.Disconnect();
+            session.Client = null;
+
+            tabControl.TabPages.Remove(session.Page);
+            _sessions.Remove(session);
+            session.Page.Dispose();
+        }
+
+        // ---------------------------------------------------------
+        // FORM KAPANIRKEN TÜM SEKMELERİN TEMİZLİĞİ
+        // ---------------------------------------------------------
+
+        private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+        {
+            foreach (var session in _sessions)
+            {
+                StopPolling(session);
+                session.Client?.Disconnect();
+            }
+        }
+
+        // ---------------------------------------------------------
+        // PARAMETRE TAŞIYICI STRUCT
+        // ---------------------------------------------------------
+
+        private struct PollingParameters
+        {
+            public byte SlaveId;
+            public ushort StartAddress;
+            public string DataType;
+            public ModbusFunctionCode FunctionCode;
+            public int UserQuantity;
+            public int IntervalMs;
+        }
+
+        // ---------------------------------------------------------
+        // TABSESSION: Her sekmenin bağımsız durumu ve kontrolleri
+        // ---------------------------------------------------------
+
+        private sealed class TabSession
+        {
+            public TabPage Page { get; }
+
+            public ModbusClient? Client { get; set; }
+            public CancellationTokenSource? PollingCts { get; set; }
+            public Task? PollingTask { get; set; }
+            public PeriodicTimer? Timer { get; set; }
+            public int CurrentIntervalMs { get; set; }
+
+            public ushort[]? OldValues { get; set; }
+            public bool[]? OldBitValues { get; set; }
+
+            public byte? LastProtocolErrorCode { get; set; }
+            public string? LastGeneralErrorMessage { get; set; }
+
+            public TextBox TxtIp { get; set; } = null!;
+            public TextBox TxtPort { get; set; } = null!;
+            public NumericUpDown NumSlaveId { get; set; } = null!;
+            public NumericUpDown NumStartAddress { get; set; } = null!;
+            public NumericUpDown NumQuantity { get; set; } = null!;
+            public NumericUpDown NumPollingInterval { get; set; } = null!;
+            public ComboBox CmbFunctionCode { get; set; } = null!;
+            public ComboBox CmbDataType { get; set; } = null!;
+            public Button BtnConnect { get; set; } = null!;
+            public Button BtnStop { get; set; } = null!;
+            public Button? BtnCloseTab { get; set; }
+            public DataGridView Dgv { get; set; } = null!;
+            public RichTextBox RtbLogs { get; set; } = null!;
+
+            public TabSession(TabPage page) { Page = page; }
         }
     }
 }

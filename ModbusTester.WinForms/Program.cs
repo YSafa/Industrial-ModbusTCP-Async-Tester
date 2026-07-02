@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Windows.Forms;
 
-namespace ModbusTester
+namespace ModbusTester.WinForms
 {
     static class Program
     {
