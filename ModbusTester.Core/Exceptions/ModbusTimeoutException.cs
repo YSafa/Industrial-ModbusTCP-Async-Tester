@@ -1,6 +1,4 @@
-using System;
-
-namespace ModbusTester.Exceptions
+namespace ModbusTester.Core.Exceptions
 {
     /// <summary>
     /// Bağlantı veya işlem belirlenen süre içinde tamamlanamadığında fırlatılır.

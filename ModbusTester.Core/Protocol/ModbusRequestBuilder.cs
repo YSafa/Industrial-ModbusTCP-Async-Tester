@@ -1,6 +1,4 @@
-using System;
-
-namespace ModbusTester.Protocol
+namespace ModbusTester.Core.Protocol
 {
     /// <summary>
     /// Modbus TCP istek paketlerini (MBAP Header + PDU) byte dizisi olarak hazırlayan sınıf.

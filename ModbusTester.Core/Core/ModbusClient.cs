@@ -1,11 +1,8 @@
-using System;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
-using ModbusTester.Exceptions;
-using ModbusTester.Protocol;
+using ModbusTester.Core.Exceptions;
+using ModbusTester.Core.Protocol;
 
-namespace ModbusTester.Core
+namespace ModbusTester.Core.Core
 {
     public class ModbusClient
     {

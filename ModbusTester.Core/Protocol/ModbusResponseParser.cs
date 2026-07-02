@@ -1,6 +1,6 @@
-using ModbusTester.Exceptions;
+using ModbusTester.Core.Exceptions;
 
-namespace ModbusTester.Protocol
+namespace ModbusTester.Core.Protocol
 {
     /// <summary>
     /// Modbus TCP yanıt paketlerini doğrulayıp veri tiplerine çeviren statik sınıf.

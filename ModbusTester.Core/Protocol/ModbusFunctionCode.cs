@@ -1,4 +1,4 @@
-namespace ModbusTester.Protocol
+namespace ModbusTester.Core.Protocol
 {
     /// <summary>
     /// Modbus protokolünde kullanılan standart fonksiyon kodları.

@@ -6,12 +6,17 @@
         <Nullable>enable</Nullable>
         <UseWindowsForms>true</UseWindowsForms>
         <ImplicitUsings>enable</ImplicitUsings>
+        <RootNamespace>ModbusTester</RootNamespace>
     </PropertyGroup>
 
     <ItemGroup>
       <Compile Update="WriteForm.cs">
         <SubType>Form</SubType>
       </Compile>
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\ModbusTester.Core\ModbusTester.Core.csproj" />
     </ItemGroup>
 
 </Project>

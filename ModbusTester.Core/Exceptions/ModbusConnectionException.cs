@@ -1,6 +1,4 @@
-using System;
-
-namespace ModbusTester.Exceptions
+namespace ModbusTester.Core.Exceptions
 {
     /// <summary>
     /// TCP soket bağlantısı kurulurken veya kesilirken oluşan hatalar için kullanılır.

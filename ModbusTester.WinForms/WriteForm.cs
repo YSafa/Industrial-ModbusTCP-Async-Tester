@@ -4,8 +4,9 @@ using System.Globalization;
 using System.Windows.Forms;
 using System.ComponentModel;
 using ModbusTester.Core;
-using ModbusTester.Exceptions;
-using ModbusTester.Protocol;
+using ModbusTester.Core.Core;
+using ModbusTester.Core.Exceptions;
+using ModbusTester.Core.Protocol;
 
 namespace ModbusTester
 {

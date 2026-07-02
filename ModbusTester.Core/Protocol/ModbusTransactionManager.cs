@@ -1,6 +1,4 @@
-using System.Threading;
-
-namespace ModbusTester.Protocol
+namespace ModbusTester.Core.Protocol
 {
     /// <summary>
     /// Her Modbus isteği için benzersiz ve sürekli artan bir Transaction ID üretir.

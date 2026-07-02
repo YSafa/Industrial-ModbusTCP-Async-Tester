@@ -1,6 +1,4 @@
-using System;
-
-namespace ModbusTester.Exceptions
+namespace ModbusTester.Core.Exceptions
 {
     /// <summary>
     /// Slave cihazın bir Modbus exception yanıtı (function code | 0x80) döndürmesi durumunda fırlatılır.

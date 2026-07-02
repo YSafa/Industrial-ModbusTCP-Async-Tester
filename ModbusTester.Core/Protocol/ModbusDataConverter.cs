@@ -1,6 +1,4 @@
-using System;
-
-namespace ModbusTester.Protocol
+namespace ModbusTester.Core.Protocol
 {
     /// <summary>
     /// Ham ushort register değerlerini anlamlı veri tiplerine (short, float, long, double, hex, binary)

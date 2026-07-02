@@ -4,8 +4,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ModbusTester.Core;
-using ModbusTester.Exceptions;
-using ModbusTester.Protocol;
+using ModbusTester.Core.Core;
+using ModbusTester.Core.Exceptions;
+using ModbusTester.Core.Protocol;
 
 namespace ModbusTester
 {
