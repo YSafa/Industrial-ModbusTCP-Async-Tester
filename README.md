@@ -181,4 +181,4 @@ This is the actual configuration file shipped with the production build:
 
 ## License
 
-This project currently has no explicit license file. Add one (MIT, Apache-2.0, etc.) if you intend for others to reuse this code.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
