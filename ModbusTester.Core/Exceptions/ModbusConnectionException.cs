@@ -1,7 +1,9 @@
+using System;
+
 namespace ModbusTester.Core.Exceptions
 {
     /// <summary>
-    /// TCP soket bağlantısı kurulurken veya kesilirken oluşan hatalar için kullanılır.
+    /// Thrown when establishing or closing a TCP socket connection fails.
     /// </summary>
     public class ModbusConnectionException : Exception
     {

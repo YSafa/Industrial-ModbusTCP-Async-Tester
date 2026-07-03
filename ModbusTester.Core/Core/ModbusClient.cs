@@ -1,13 +1,24 @@
+using System;
 using System.Buffers;
 using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 using ModbusTester.Core.Exceptions;
 using ModbusTester.Core.Protocol;
 
 namespace ModbusTester.Core.Core
 {
+    /// <summary>
+    /// Manages connecting to, disconnecting from, and reading/writing data with a Modbus TCP
+    /// slave device.
+    /// </summary>
     public class ModbusClient
     {
-        // Nullable Reference Types aktif; tüm referans alanlar açıkça null-atanabilir tanımlandı.
+        // Modbus TCP allows a maximum of 125 registers per single Read Holding/Input Registers
+        // request (FC03/FC04). Requests exceeding this limit are automatically split into
+        // sequential chunks and stitched back together.
+        private const int MaxRegistersPerRequest = 125;
+
         private TcpClient? _tcpClient;
         private NetworkStream? _networkStream;
 
@@ -29,7 +40,7 @@ namespace ModbusTester.Core.Core
         }
 
         // ---------------------------------------------------------
-        // BAĞLANTI YÖNETİMİ
+        // CONNECTION MANAGEMENT
         // ---------------------------------------------------------
 
         public async Task ConnectAsync()
@@ -47,7 +58,7 @@ namespace ModbusTester.Core.Core
                 if (completedTask != connectTask)
                 {
                     throw new ModbusTimeoutException(
-                        $"'{_ipAddress}:{_port}' adresine bağlanırken zaman aşımı oluştu ({ConnectTimeoutMs} ms).");
+                        $"Timed out connecting to '{_ipAddress}:{_port}' ({ConnectTimeoutMs} ms).");
                 }
 
                 await connectTask;
@@ -57,7 +68,7 @@ namespace ModbusTester.Core.Core
             catch (SocketException socketEx)
             {
                 throw new ModbusConnectionException(
-                    $"'{_ipAddress}:{_port}' adresine bağlanılamadı: {socketEx.Message}", socketEx);
+                    $"Could not connect to '{_ipAddress}:{_port}': {socketEx.Message}", socketEx);
             }
             catch (ModbusTimeoutException)
             {
@@ -65,7 +76,7 @@ namespace ModbusTester.Core.Core
             }
             catch (Exception ex)
             {
-                throw new ModbusConnectionException($"Bağlantı sırasında beklenmeyen hata: {ex.Message}", ex);
+                throw new ModbusConnectionException($"Unexpected error while connecting: {ex.Message}", ex);
             }
         }
 
@@ -78,7 +89,7 @@ namespace ModbusTester.Core.Core
             }
             catch (Exception ex)
             {
-                throw new ModbusConnectionException($"Bağlantı kapatılırken hata oluştu: {ex.Message}", ex);
+                throw new ModbusConnectionException($"Error while closing the connection: {ex.Message}", ex);
             }
             finally
             {
@@ -88,30 +99,35 @@ namespace ModbusTester.Core.Core
         }
 
         // ---------------------------------------------------------
-        // OKUMA FONKSİYONLARI (FC01 / FC02 / FC03 / FC04)
+        // READ FUNCTIONS (FC01 / FC02 / FC03 / FC04)
         // ---------------------------------------------------------
 
+        /// <summary>FC03 - Read Holding Registers.</summary>
         public Task ReadHoldingRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination)
             => ReadRegistersInternalAsync(ModbusFunctionCode.ReadHoldingRegisters, slaveId, startAddress, destination);
 
+        /// <summary>FC04 - Read Input Registers.</summary>
         public Task ReadInputRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination)
             => ReadRegistersInternalAsync(ModbusFunctionCode.ReadInputRegisters, slaveId, startAddress, destination);
 
+        /// <summary>FC01 - Read Coils.</summary>
         public Task<bool[]> ReadCoilsAsync(byte slaveId, ushort startAddress, ushort quantity)
             => ReadBitsInternalAsync(ModbusFunctionCode.ReadCoils, slaveId, startAddress, quantity);
 
+        /// <summary>FC02 - Read Discrete Inputs.</summary>
         public Task<bool[]> ReadDiscreteInputsAsync(byte slaveId, ushort startAddress, ushort quantity)
             => ReadBitsInternalAsync(ModbusFunctionCode.ReadDiscreteInputs, slaveId, startAddress, quantity);
 
-        // FC03/FC04 tek seferde en fazla 125 register okuyabilir; bu sınırı aşan istekler
-        // otomatik olarak ardışık parçalara (chunk) bölünüp sırayla okunur ve tek bir dizide birleştirilir.
-        private const int MaxRegistersPerRequest = 125;
-
+        /// <summary>
+        /// Shared implementation for FC03/FC04 register reads. Writes results directly into the
+        /// destination buffer supplied by the caller — no per-call array allocation. Automatically
+        /// splits requests exceeding 125 registers into sequential chunks.
+        /// </summary>
         private async Task ReadRegistersInternalAsync(
             ModbusFunctionCode functionCode, byte slaveId, ushort startAddress, ushort[] destination)
         {
             if (destination == null || destination.Length == 0)
-                throw new ArgumentException("Hedef tampon (destination) boş veya null olamaz.", nameof(destination));
+                throw new ArgumentException("Destination buffer cannot be null or empty.", nameof(destination));
 
             int remaining = destination.Length;
             int destinationOffset = 0;
@@ -127,9 +143,9 @@ namespace ModbusTester.Core.Core
 
                 byte[] response = await SendAndReceiveAsync(request);
 
-                // response.AsSpan() ve destination.AsSpan(...) burada birer LOCAL DEĞİŞKENE
-                // atanmadan, doğrudan tek bir senkron çağrının argümanı olarak üretiliyor; hiçbir
-                // await sınırını geçmedikleri için CS4012'yi tetiklemezler.
+                // response.AsSpan() and destination.AsSpan(...) are produced directly as
+                // arguments to a single synchronous call, without being assigned to a LOCAL
+                // VARIABLE, so they never cross an await boundary and do not trigger CS4012.
                 ModbusResponseParser.ParseReadRegistersResponse(
                     response, destination.AsSpan(destinationOffset, chunkSize), transactionId);
 
@@ -148,12 +164,12 @@ namespace ModbusTester.Core.Core
         }
 
         // ---------------------------------------------------------
-        // YAZMA FONKSİYONLARI (FC05 / FC06 / FC16)
+        // WRITE FUNCTIONS (FC05 / FC06 / FC16)
         // ---------------------------------------------------------
 
         /// <summary>
-        /// FC05 (Write Single Coil): Tek bir coil'e True veya False yazar.
-        /// Slave gönderilen paketi echo olarak geri döndürür; parser bu echo'yu doğrular.
+        /// FC05 (Write Single Coil): writes True or False to a single coil.
+        /// The slave echoes the sent packet back; the parser validates this echo.
         /// </summary>
         public async Task WriteSingleCoilAsync(byte slaveId, ushort address, bool value)
         {
@@ -166,8 +182,8 @@ namespace ModbusTester.Core.Core
         }
 
         /// <summary>
-        /// FC06 (Write Single Register): Tek bir holding register'a 16-bit değer yazar.
-        /// Slave gönderilen paketi echo olarak geri döndürür; parser bu echo'yu doğrular.
+        /// FC06 (Write Single Register): writes a 16-bit value to a single holding register.
+        /// The slave echoes the sent packet back; the parser validates this echo.
         /// </summary>
         public async Task WriteSingleRegisterAsync(byte slaveId, ushort address, ushort value)
         {
@@ -180,14 +196,14 @@ namespace ModbusTester.Core.Core
         }
 
         /// <summary>
-        /// FC16 (Write Multiple Registers): Ardışık birden fazla holding register'a toplu değer yazar.
-        /// Slave başlangıç adresi ve yazılan register sayısını echo olarak geri döndürür.
+        /// FC16 (Write Multiple Registers): writes a batch of values to consecutive holding
+        /// registers. The slave echoes back the start address and the number of registers written.
         /// </summary>
         public async Task WriteMultipleRegistersAsync(byte slaveId, ushort startAddress, ushort[] values)
         {
             if (values == null || values.Length == 0)
             {
-                throw new ArgumentException("Yazılacak register dizisi boş olamaz.", nameof(values));
+                throw new ArgumentException("The register array to write cannot be empty.", nameof(values));
             }
 
             ushort transactionId = _transactionManager.GetNextTransactionId();
@@ -199,18 +215,22 @@ namespace ModbusTester.Core.Core
         }
 
         // ---------------------------------------------------------
-        // AĞIRLAMA (SEND / RECEIVE) ve YARDIMCI METOTLAR
+        // TRANSPORT (SEND / RECEIVE) AND HELPERS
         // ---------------------------------------------------------
 
         internal async Task<byte[]> SendAndReceiveAsync(byte[] requestBuffer)
         {
             if (!IsConnected || _networkStream == null)
             {
-                throw new ModbusConnectionException("İstek gönderilemedi: aktif bir bağlantı yok.");
+                throw new ModbusConnectionException("Cannot send request: no active connection.");
             }
 
+            // Semaphore: guarantees only one transaction can use the socket at a time.
             await _networkSemaphore.WaitAsync();
 
+            // Rented from the pool to cover the maximum Modbus TCP ADU size
+            // (MBAP header 6 + Unit ID 1 + PDU max 253 = 260 bytes); avoids a new array
+            // allocation on every transaction.
             byte[] rentBuffer = ArrayPool<byte>.Shared.Rent(260);
 
             try
@@ -219,22 +239,29 @@ namespace ModbusTester.Core.Core
 
                 await _networkStream!.WriteAsync(requestBuffer, 0, requestBuffer.Length, cts.Token);
 
+                // The first 6 bytes of the MBAP header are read directly into the start of the rented buffer.
                 await ReadExactAsync(rentBuffer, 0, 6, cts.Token);
 
+                // Length field is Big-Endian: MSB first, LSB second.
                 ushort remainingLength = (ushort)((rentBuffer[4] << 8) | rentBuffer[5]);
 
+                // Guard Clause: validated before continuing with socket I/O. Otherwise, a
+                // corrupted/noisy packet could attempt to exceed the bounds of the rented
+                // 260-byte buffer and throw an ArgumentOutOfRangeException. Instead, we detect
+                // this here and reset the socket cleanly — trying to guess how many bytes to
+                // discard from the stream based on a corrupted length field is unsafe; the only
+                // reliable option once stream alignment is lost is to close and reconnect.
                 if (remainingLength < 2 || remainingLength > 254)
                 {
-                    // Akış hizası tamamen kaybolduğu için soketi derhal kapatıyoruz.
                     Disconnect();
 
-                    // Hata tipi ModbusConnectionException: bu bir cihaz-seviyesi protokol hatası değil,
-                    // bizim stream'i güvenilir okuyamadığımızın kanıtı olan bir bağlantı bütünlüğü sorunudur.
-                    // Üst katmanların (WinForms/Console) bunu ModbusTimeoutException/ModbusConnectionException
-                    // ile aynı kefeye koyup TryReconnectAsync'i O AN, gecikmesiz tetiklemesini sağlar.
+                    // Deliberately a ModbusConnectionException, not a ModbusProtocolException:
+                    // this is not a legitimate device-level protocol error but evidence that we
+                    // could no longer reliably read the stream — a transport integrity issue.
+                    // This lets upstream layers (WinForms/Console) trigger reconnect logic
+                    // immediately, in the same tick, instead of one cycle later.
                     throw new ModbusConnectionException(
-                        $"Ağ protokol ihlali: Geçersiz paket uzunluğu algılandı ({remainingLength} byte). Akış senkronizasyonu kaybolduğu için bağlantı sonlandırıldı."
-                    );
+                        $"Network protocol violation: invalid packet length detected ({remainingLength} bytes). Connection closed due to lost stream synchronization.");
                 }
 
                 await ReadExactAsync(rentBuffer, 6, remainingLength, cts.Token);
@@ -248,41 +275,43 @@ namespace ModbusTester.Core.Core
             {
                 Disconnect();
                 throw new ModbusTimeoutException(
-                    $"Veri gönderme/alma işlemi {IoTimeoutMs} ms içinde tamamlanamadı.");
+                    $"Send/receive operation did not complete within {IoTimeoutMs} ms.");
             }
             catch (SocketException socketEx)
             {
                 Disconnect();
-                throw new ModbusConnectionException($"Ağ üzerinden veri alışverişinde hata: {socketEx.Message}", socketEx);
+                throw new ModbusConnectionException($"Network I/O error: {socketEx.Message}", socketEx);
             }
             catch (ModbusConnectionException)
             {
-                // Guard clause'dan gelen (Disconnect zaten çağrılmış) ModbusConnectionException'ı
-                // olduğu gibi yukarı taşıyoruz; tekrar Disconnect() çağırıp yeniden sarmalamaya gerek yok.
+                // Re-thrown as-is from the guard clause above (Disconnect already called);
+                // no need to wrap it again.
                 throw;
             }
             catch (ModbusProtocolException)
             {
-                // Yalnızca cihazdan gelen meşru Modbus exception yanıtları (0x01-0x0B) için ayrılmıştır;
-                // bağlantı sağlam kaldığı için Disconnect() çağrılmadan olduğu gibi yukarı taşınır.
+                // Reserved for legitimate device-level Modbus exception responses (0x01-0x0B);
+                // the connection stays alive, so it is passed up unchanged without disconnecting.
                 throw;
             }
             catch (Exception ex)
             {
                 Disconnect();
-                throw new ModbusConnectionException($"Beklenmeyen veri alışverişi hatası: {ex.Message}", ex);
+                throw new ModbusConnectionException($"Unexpected send/receive error: {ex.Message}", ex);
             }
             finally
             {
+                // The rented buffer is always returned to the pool, success or failure.
                 ArrayPool<byte>.Shared.Return(rentBuffer);
                 _networkSemaphore.Release();
             }
         }
 
         /// <summary>
-        /// NetworkStream'den tam olarak istenen sayıda byte'ı, dışarıdan verilen tampona (buffer)
-        /// belirtilen offset'ten itibaren okur. Artık kendi dizisini tahsis etmiyor; çağıran taraf
-        /// (SendAndReceiveAsync) havuzdan kiraladığı tamponu bu metoda geçiriyor.
+        /// Reads exactly the requested number of bytes from the NetworkStream into the caller's
+        /// buffer, starting at the given offset. TCP may deliver data in fragments, so a single
+        /// ReadAsync call may not be sufficient; this loop continues until the requested amount
+        /// has been read in full.
         /// </summary>
         private async Task ReadExactAsync(byte[] buffer, int offset, int byteCount, CancellationToken token)
         {
@@ -294,7 +323,7 @@ namespace ModbusTester.Core.Core
 
                 if (read == 0)
                 {
-                    throw new ModbusConnectionException("Bağlantı karşı taraf tarafından beklenmedik şekilde kapatıldı.");
+                    throw new ModbusConnectionException("Connection was closed unexpectedly by the remote host.");
                 }
 
                 totalRead += read;

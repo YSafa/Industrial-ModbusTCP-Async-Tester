@@ -1,8 +1,7 @@
 namespace ModbusTester.Core.Protocol
 {
     /// <summary>
-    /// Modbus protokolünde kullanılan standart fonksiyon kodları.
-    /// Şimdilik sadece bu projede kullanacağımız kodları tanımlıyoruz; ihtiyaç oldukça genişletilecek.
+    /// Standard Modbus function codes used by this project.
     /// </summary>
     public enum ModbusFunctionCode : byte
     {

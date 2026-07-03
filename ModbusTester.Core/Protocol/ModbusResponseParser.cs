@@ -3,18 +3,19 @@ using ModbusTester.Core.Exceptions;
 namespace ModbusTester.Core.Protocol
 {
     /// <summary>
-    /// Modbus TCP yanıt paketlerini doğrulayıp veri tiplerine çeviren statik sınıf.
-    /// Okuma (FC01/02/03/04) ve yazma (FC05/06/16) yanıtlarını destekler.
+    /// Validates Modbus TCP response packets and decodes them into usable data types.
+    /// Supports read (FC01/02/03/04) and write (FC05/06/16) response validation.
     /// </summary>
     public static class ModbusResponseParser
     {
         // ---------------------------------------------------------
-        // OKUMA YANIT AYRIŞTIRICILARI
+        // REGISTER READ PARSING (ALLOCATION-FREE)
         // ---------------------------------------------------------
 
         /// <summary>
-        /// FC03/FC04 yanıtını çözümleyip doğrudan çağıranın verdiği hedef tampona (destination) yazar.
-        /// Artık yeni bir ushort[] tahsis etmez; response de ReadOnlySpan olarak alınır.
+        /// Parses an FC03 (Read Holding Registers) / FC04 (Read Input Registers) response and
+        /// writes the decoded values directly into the caller-supplied destination buffer.
+        /// Does not allocate a new array; response is accepted as a ReadOnlySpan for performance.
         /// </summary>
         public static void ParseReadRegistersResponse(ReadOnlySpan<byte> response, Span<ushort> destination, ushort expectedTransactionId)
         {
@@ -24,15 +25,13 @@ namespace ModbusTester.Core.Protocol
             byte byteCount = response[8];
             int registerCount = byteCount / 2;
 
-            // Ek güvenlik: slave'in bildirdiği register sayısı, çağıranın ayırdığı tampon boyutuyla
-            // uyuşmuyorsa (örn. bozuk/beklenmedik bir yanıt), Span sınırlarını aşmadan önce
-            // burada net bir protokol hatası fırlatıyoruz. Bu kontrol öncesinde ModbusClient
-            // tarafında yapılan chunkData.Length karşılaştırmasının artık burada olması, mantığı
-            // tek bir yere topluyor.
+            // Safety check: if the register count reported by the slave doesn't match the size
+            // of the buffer the caller allocated (e.g. a corrupted/unexpected response), we fail
+            // fast here with a clear protocol error before ever touching the Span bounds.
             if (registerCount != destination.Length)
             {
                 throw new ModbusProtocolException(0x04,
-                    $"Yanıttaki register sayısı beklenenle uyuşmuyor. Beklenen: {destination.Length}, Gelen: {registerCount}.");
+                    $"Register count in response does not match expected. Expected: {destination.Length}, Received: {registerCount}.");
             }
 
             for (int i = 0; i < registerCount; i++)
@@ -42,31 +41,9 @@ namespace ModbusTester.Core.Protocol
             }
         }
 
-        private static void ValidateTransactionId(ReadOnlySpan<byte> response, ushort expectedTransactionId)
-        {
-            ushort receivedId = (ushort)((response[0] << 8) | response[1]);
-
-            if (receivedId != expectedTransactionId)
-            {
-                throw new ModbusProtocolException(0,
-                    $"Transaction ID uyuşmuyor. Beklenen: {expectedTransactionId}, Gelen: {receivedId}.");
-            }
-        }
-
-        private static void ValidateNotException(ReadOnlySpan<byte> response)
-        {
-            byte functionCode = response[7];
-
-            if ((functionCode & 0x80) != 0)
-            {
-                byte exceptionCode = response[8];
-                throw new ModbusProtocolException(exceptionCode, $"{exceptionCode:D2} - {GetExceptionDescription(exceptionCode)}");
-            }
-        }
-
         /// <summary>
-        /// FC01 (Read Coils) ve FC02 (Read Discrete Inputs) yanıtlarını çözümler.
-        /// Veriler byte içine sıkıştırılmış (bit-packed) halde gelir; LSB'den itibaren ayrıştırılır.
+        /// Parses an FC01 (Read Coils) / FC02 (Read Discrete Inputs) response. Data arrives
+        /// bit-packed within bytes and is unpacked starting from the LSB of each byte.
         /// </summary>
         public static bool[] ParseReadBitsResponse(byte[] response, ushort expectedTransactionId, int requestedQuantity)
         {
@@ -83,7 +60,7 @@ namespace ModbusTester.Core.Protocol
 
                 if (byteIndex >= byteCount) break;
 
-                // Sağa kaydırıp en düşük biti maskeleyerek (& 0x01) ilgili bitin durumunu okuyoruz.
+                // Right-shift and mask the lowest bit (& 0x01) to read the state of that bit.
                 bits[i] = ((response[9 + byteIndex] >> bitIndex) & 0x01) == 1;
             }
 
@@ -91,19 +68,14 @@ namespace ModbusTester.Core.Protocol
         }
 
         // ---------------------------------------------------------
-        // YAZMA YANIT DOĞRULAYICILARI
+        // WRITE RESPONSE VALIDATION
         // ---------------------------------------------------------
 
         /// <summary>
-        /// FC05 (Write Single Coil) ve FC06 (Write Single Register) yanıtlarını doğrular.
-        /// Modbus bu fonksiyonlara "echo" yanıtı döndürür: gönderilen paket aynen yansıtılır.
-        ///
-        /// Doğrulama kapsamı: Transaction ID + Exception kontrolü + Function Code + Adres eşleşmesi.
+        /// Validates an FC05 (Write Single Coil) / FC06 (Write Single Register) response.
+        /// These functions return an "echo" response: the request is reflected back as-is.
+        /// Validates: Transaction ID + exception check + Function Code + address match.
         /// </summary>
-        /// <param name="response">Slave'den gelen ham yanıt paketi</param>
-        /// <param name="expectedTransactionId">İstekte kullanılan Transaction ID</param>
-        /// <param name="expectedFunctionCode">Gönderilen fonksiyon kodu (FC05 veya FC06)</param>
-        /// <param name="expectedAddress">Yazma yapılan adres; echo'nun doğru adrese ait olduğunu teyit eder</param>
         public static void ValidateWriteSingleResponse(
             byte[] response, ushort expectedTransactionId,
             ModbusFunctionCode expectedFunctionCode, ushort expectedAddress)
@@ -112,24 +84,20 @@ namespace ModbusTester.Core.Protocol
             ValidateNotException(response);
             ValidateFunctionCode(response, expectedFunctionCode);
 
-            // Echo yanıtındaki adresin bizim yazdığımız adresle eşleştiğini doğruluyoruz.
             ushort echoAddress = (ushort)((response[8] << 8) | response[9]);
 
             if (echoAddress != expectedAddress)
             {
                 throw new ModbusProtocolException(0,
-                    $"Yazma yanıtındaki adres uyuşmuyor. Beklenen: {expectedAddress}, Gelen: {echoAddress}.");
+                    $"Address in write response does not match. Expected: {expectedAddress}, Received: {echoAddress}.");
             }
         }
 
         /// <summary>
-        /// FC16 (Write Multiple Registers) yanıtını doğrular.
-        ///
-        /// FC16 echo yanıtı daha kısadır (12 byte): slave yalnızca başlangıç adresini ve
-        /// yazılan register sayısını döndürür (tüm değerleri yansıtmaz).
-        /// Doğrulama: Transaction ID + Exception + Function Code + Adres + Register Sayısı.
+        /// Validates an FC16 (Write Multiple Registers) response.
+        /// The FC16 echo is shorter (12 bytes): the slave returns only the start address and
+        /// the register count it wrote (not the full data payload).
         /// </summary>
-        /// <param name="expectedRegisterCount">Yazma isteğinde gönderilen register sayısı</param>
         public static void ValidateWriteMultipleRegistersResponse(
             byte[] response, ushort expectedTransactionId,
             ushort expectedAddress, ushort expectedRegisterCount)
@@ -143,39 +111,39 @@ namespace ModbusTester.Core.Protocol
             if (echoAddress != expectedAddress)
             {
                 throw new ModbusProtocolException(0,
-                    $"FC16 yanıtındaki adres uyuşmuyor. Beklenen: {expectedAddress}, Gelen: {echoAddress}.");
+                    $"Address in FC16 response does not match. Expected: {expectedAddress}, Received: {echoAddress}.");
             }
 
-            // Slave'in kaç register yazdığını teyit eden quantity alanını da kontrol ediyoruz.
             ushort echoQuantity = (ushort)((response[10] << 8) | response[11]);
 
             if (echoQuantity != expectedRegisterCount)
             {
                 throw new ModbusProtocolException(0,
-                    $"FC16 yanıtındaki register sayısı uyuşmuyor. Beklenen: {expectedRegisterCount}, Gelen: {echoQuantity}.");
+                    $"Register count in FC16 response does not match. Expected: {expectedRegisterCount}, Received: {echoQuantity}.");
             }
         }
 
         // ---------------------------------------------------------
-        // ORTAK DOĞRULAMA YARDIMCILARI
+        // SHARED VALIDATION HELPERS
         // ---------------------------------------------------------
 
-        private static void ValidateTransactionId(byte[] response, ushort expectedTransactionId)
+        private static void ValidateTransactionId(ReadOnlySpan<byte> response, ushort expectedTransactionId)
         {
             ushort receivedId = (ushort)((response[0] << 8) | response[1]);
 
             if (receivedId != expectedTransactionId)
             {
                 throw new ModbusProtocolException(0,
-                    $"Transaction ID uyuşmuyor. Beklenen: {expectedTransactionId}, Gelen: {receivedId}.");
+                    $"Transaction ID mismatch. Expected: {expectedTransactionId}, Received: {receivedId}.");
             }
         }
 
-        private static void ValidateNotException(byte[] response)
+        private static void ValidateNotException(ReadOnlySpan<byte> response)
         {
             byte functionCode = response[7];
 
-            // Slave hata döndürdüğünde function code'un 7. biti (MSB) 1'e set edilir (örn: 0x03 -> 0x83).
+            // When the slave signals an error, bit 7 (MSB) of the function code is set
+            // (e.g. 0x03 becomes 0x83).
             if ((functionCode & 0x80) != 0)
             {
                 byte exceptionCode = response[8];
@@ -184,17 +152,19 @@ namespace ModbusTester.Core.Protocol
             }
         }
 
-        private static void ValidateFunctionCode(byte[] response, ModbusFunctionCode expected)
+        private static void ValidateFunctionCode(ReadOnlySpan<byte> response, ModbusFunctionCode expected)
         {
             byte received = response[7];
 
             if (received != (byte)expected)
             {
                 throw new ModbusProtocolException(0,
-                    $"Function code uyuşmuyor. Beklenen: 0x{(byte)expected:X2}, Gelen: 0x{received:X2}.");
+                    $"Function code mismatch. Expected: 0x{(byte)expected:X2}, Received: 0x{received:X2}.");
             }
         }
 
+        // Kept intentionally bilingual: these are the official Modbus standard exception
+        // descriptions and remain useful as a quick reference regardless of UI language.
         private static string GetExceptionDescription(byte exceptionCode)
         {
             return exceptionCode switch
@@ -208,7 +178,7 @@ namespace ModbusTester.Core.Protocol
                 0x08 => "Memory Parity Error (Bellek paritesi hatası)",
                 0x0A => "Gateway Path Unavailable (Geçit yolu kullanılamıyor)",
                 0x0B => "Gateway Target Device Failed to Respond (Hedef cihaz yanıt vermedi)",
-                _    => "Bilinmeyen Modbus hata kodu"
+                _    => "Unknown Modbus exception code"
             };
         }
     }

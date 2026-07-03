@@ -1,7 +1,9 @@
+using System;
+
 namespace ModbusTester.Core.Exceptions
 {
     /// <summary>
-    /// Bağlantı veya işlem belirlenen süre içinde tamamlanamadığında fırlatılır.
+    /// Thrown when a connection or I/O operation does not complete within the configured timeout.
     /// </summary>
     public class ModbusTimeoutException : Exception
     {
