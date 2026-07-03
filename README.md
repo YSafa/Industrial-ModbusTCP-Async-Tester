@@ -10,7 +10,7 @@ The solution ships with **two independent front-ends** sharing the same core lib
 Both front-ends are available as **pre-built, self-contained executables** — no .NET SDK or runtime installation required on the target machine. See [Production Deployment & Pre-built Executables](#production-deployment--pre-built-executables) below.
 
 ---
-
+ 
 ## Solution Structure
 
 ```
