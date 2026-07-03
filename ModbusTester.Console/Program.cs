@@ -22,7 +22,7 @@ using ModbusTester.Core.Protocol;
     int    currentPort = settings.GetValue<int?>("TargetPort")   ?? 502;
 
     // ---------------------------------------------------------
-    // GRACEFUL SHUTDOWN: Ctrl+C sinyalini yakalayıp CancellationToken'a bağlıyoruz.
+    // GRACEFUL SHUTDOWN
     // ---------------------------------------------------------
     using var cts = new CancellationTokenSource();
 
@@ -41,254 +41,288 @@ using ModbusTester.Core.Protocol;
         IoTimeoutMs       = settings.GetValue<int?>("IoTimeoutMs")     ?? 3000
     };
 
-    try
-    {
-        await client.ConnectAsync();
-        Log($"'{currentIp}:{currentPort}' adresine bağlantı başarılı.", ConsoleColor.Green);
-    }
-    catch (ModbusConnectionException ex)
-    {
-        Log($"BAĞLANTI HATASI: {ex.Message}", ConsoleColor.Red);
-        return;
-    }
-    catch (ModbusTimeoutException ex)
-    {
-        Log($"BAĞLANTI ZAMAN AŞIMI: {ex.Message}", ConsoleColor.Red);
-        return;
-    }
-
-    // ---------------------------------------------------------
-    // ANA POLLING DÖNGÜSÜ
-    // ---------------------------------------------------------
     long cycleCounter = 0;
-
     ushort[]? oldValues = null;
     ushort oldStartAddress = 0;
     string lastKnownDataType = settings.GetValue<string>("DataType") ?? "Unsigned (16-bit)";
     int lastKnownRegisterSize = GetRegisterSizeForDataType(lastKnownDataType);
-
     string? lastLoggedError = null;
-
     int lastKnownIntervalMs = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
 
     int initialQuantity = settings.GetValue<int?>("Quantity") ?? 1;
     ushort[] readBuffer = new ushort[Math.Max(1, initialQuantity) * lastKnownRegisterSize];
 
-    PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromMilliseconds(lastKnownIntervalMs));
-
     try
     {
+        // ===========================================================
+        // DIŞ DÖNGÜ (OUTER LOOP): Bağlantıyı sağlamak/yeniden sağlamak.
+        // ===========================================================
         while (!cts.Token.IsCancellationRequested)
         {
-            bool tickReceived;
+            bool connected = await EstablishConnectionAsync();
+            if (!connected)
+            {
+                break; // Yalnızca Ctrl+C nedeniyle buraya düşülür.
+            }
+
+            oldValues = null;
+            lastLoggedError = null;
+
+            // ===========================================================
+            // İÇ DÖNGÜ (INNER LOOP): PeriodicTimer tabanlı asıl polling akışı.
+            // ===========================================================
+            PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromMilliseconds(lastKnownIntervalMs));
+
             try
             {
-                tickReceived = await timer.WaitForNextTickAsync(cts.Token);
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    bool tickReceived;
+                    try
+                    {
+                        tickReceived = await timer.WaitForNextTickAsync(cts.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+
+                    if (!tickReceived) break;
+
+                    cycleCounter++;
+
+                    byte   liveSlaveId      = (byte)(settings.GetValue<int?>("SlaveId") ?? 1);
+                    ushort liveStartAddress = (ushort)(settings.GetValue<int?>("StartAddress") ?? 0);
+                    int    liveQuantity     = settings.GetValue<int?>("Quantity") ?? 1;
+                    int    liveIntervalMs   = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
+                    string liveIp           = settings.GetValue<string>("TargetIp") ?? currentIp;
+                    int    livePort         = settings.GetValue<int?>("TargetPort") ?? currentPort;
+                    string liveDataType     = settings.GetValue<string>("DataType") ?? "Unsigned (16-bit)";
+
+                    if (liveIntervalMs != lastKnownIntervalMs && liveIntervalMs > 0)
+                    {
+                        Log($"Polling aralığı değişti: {lastKnownIntervalMs}ms -> {liveIntervalMs}ms. Timer yeniden başlatılıyor.", ConsoleColor.Cyan);
+                        timer.Dispose();
+                        timer = new PeriodicTimer(TimeSpan.FromMilliseconds(liveIntervalMs));
+                        lastKnownIntervalMs = liveIntervalMs;
+                    }
+
+                    if (liveIp != currentIp || livePort != currentPort)
+                    {
+                        Log($"Bağlantı parametreleri değişti: '{currentIp}:{currentPort}' -> '{liveIp}:{livePort}'. Yeniden bağlanılıyor.", ConsoleColor.Cyan);
+
+                        var temporaryClient = new ModbusClient(liveIp, livePort)
+                        {
+                            ConnectTimeoutMs = settings.GetValue<int?>("ConnectTimeoutMs") ?? 3000,
+                            IoTimeoutMs       = settings.GetValue<int?>("IoTimeoutMs")     ?? 3000
+                        };
+
+                        try
+                        {
+                            await temporaryClient.ConnectAsync();
+
+                            client.Disconnect();
+                            client = temporaryClient;
+                            currentIp = liveIp;
+                            currentPort = livePort;
+
+                            Log($"'{currentIp}:{currentPort}' adresine yeniden bağlantı başarılı.", ConsoleColor.Green);
+                            oldValues = null;
+                        }
+                        catch (Exception ex)
+                        {
+                            temporaryClient.Disconnect();
+                            Log($"Yeni parametrelerle bağlantı kurulamadı: {ex.Message} — bir sonraki tick'te tekrar denenecek.", ConsoleColor.Red);
+                            continue;
+                        }
+                    }
+
+                    try
+                    {
+                        int liveRegisterSize = GetRegisterSizeForDataType(liveDataType);
+
+                        int requiredLength = Math.Max(1, liveQuantity) * liveRegisterSize;
+                        if (readBuffer.Length != requiredLength)
+                        {
+                            readBuffer = new ushort[requiredLength];
+                            oldValues = null;
+                        }
+
+                        await client.ReadHoldingRegistersAsync(liveSlaveId, liveStartAddress, readBuffer);
+
+                        if (lastLoggedError != null)
+                        {
+                            Log("[RECOVERY] Driver successfully recovered from previous errors. Data stream is back to normal.", ConsoleColor.Cyan);
+                            lastLoggedError = null;
+                        }
+
+                        bool layoutChanged = oldValues == null ||
+                                             oldValues.Length != readBuffer.Length ||
+                                             oldStartAddress != liveStartAddress ||
+                                             lastKnownDataType != liveDataType;
+
+                        string? changeLog = layoutChanged
+                            ? BuildFullChangeLog(readBuffer, liveStartAddress, liveDataType, liveRegisterSize)
+                            : BuildDiffChangeLog(oldValues!, readBuffer, liveStartAddress, liveDataType, liveRegisterSize);
+
+                        if (changeLog != null)
+                        {
+                            Log($"[DATA CHANGED - Cycle #{cycleCounter}] -> {changeLog}", ConsoleColor.Green);
+
+                            oldValues = (ushort[])readBuffer.Clone();
+                            oldStartAddress = liveStartAddress;
+                            lastKnownDataType = liveDataType;
+                            lastKnownRegisterSize = liveRegisterSize;
+                        }
+                        else if (cycleCounter % 100 == 0)
+                        {
+                            Log($"[HEARTBEAT - Cycle #{cycleCounter}] Driver alive, data stream stable.", ConsoleColor.DarkGray);
+                        }
+                    }
+                    catch (ModbusProtocolException ex)
+                    {
+                        if (cts.Token.IsCancellationRequested) break;
+
+                        string errorMessage = $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}";
+
+                        if (lastLoggedError != errorMessage)
+                        {
+                            Log(errorMessage, ConsoleColor.Red);
+                            lastLoggedError = errorMessage;
+                        }
+                    }
+                    catch (ModbusTimeoutException ex)
+                    {
+                        if (cts.Token.IsCancellationRequested) break;
+
+                        string errorMessage = $"ZAMAN AŞIMI: {ex.Message}";
+
+                        if (lastLoggedError != errorMessage)
+                        {
+                            Log(errorMessage, ConsoleColor.Red);
+                            lastLoggedError = errorMessage;
+                        }
+
+                        oldValues = null;
+
+                        bool reconnected = await TryReconnectAsync();
+                        if (!reconnected)
+                        {
+                            Log("Yeniden bağlanma denemeleri tükendi, bağlantı fazına geri dönülüyor...", ConsoleColor.Red);
+                            break;
+                        }
+                    }
+                    catch (ModbusConnectionException ex)
+                    {
+                        if (cts.Token.IsCancellationRequested) break;
+
+                        string errorMessage = $"BAĞLANTI HATASI: {ex.Message}";
+
+                        if (lastLoggedError != errorMessage)
+                        {
+                            Log(errorMessage, ConsoleColor.Red);
+                            lastLoggedError = errorMessage;
+                        }
+
+                        oldValues = null;
+
+                        bool reconnected = await TryReconnectAsync();
+                        if (!reconnected)
+                        {
+                            Log("Yeniden bağlanma denemeleri tükendi, bağlantı fazına geri dönülüyor...", ConsoleColor.Red);
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        if (cts.Token.IsCancellationRequested) break;
+
+                        string errorMessage = $"BEKLENMEYEN HATA: {ex.Message}";
+
+                        if (lastLoggedError != errorMessage)
+                        {
+                            Log(errorMessage, ConsoleColor.Red);
+                            lastLoggedError = errorMessage;
+                        }
+                    }
+                }
             }
-            catch (OperationCanceledException)
+            finally
             {
-                break;
-            }
-
-            if (!tickReceived) break;
-
-            cycleCounter++;
-
-            byte   liveSlaveId      = (byte)(settings.GetValue<int?>("SlaveId") ?? 1);
-            ushort liveStartAddress = (ushort)(settings.GetValue<int?>("StartAddress") ?? 0);
-            int    liveQuantity     = settings.GetValue<int?>("Quantity") ?? 1;
-            int    liveIntervalMs   = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
-            string liveIp           = settings.GetValue<string>("TargetIp") ?? currentIp;
-            int    livePort         = settings.GetValue<int?>("TargetPort") ?? currentPort;
-            string liveDataType     = settings.GetValue<string>("DataType") ?? "Unsigned (16-bit)";
-
-            if (liveIntervalMs != lastKnownIntervalMs && liveIntervalMs > 0)
-            {
-                Log($"Polling aralığı değişti: {lastKnownIntervalMs}ms -> {liveIntervalMs}ms. Timer yeniden başlatılıyor.", ConsoleColor.Cyan);
                 timer.Dispose();
-                timer = new PeriodicTimer(TimeSpan.FromMilliseconds(liveIntervalMs));
-                lastKnownIntervalMs = liveIntervalMs;
-            }
-
-            if (liveIp != currentIp || livePort != currentPort)
-            {
-                Log($"Bağlantı parametreleri değişti: '{currentIp}:{currentPort}' -> '{liveIp}:{livePort}'. Yeniden bağlanılıyor.", ConsoleColor.Cyan);
-
-                client.Disconnect();
-                currentIp   = liveIp;
-                currentPort = livePort;
-
-                client = new ModbusClient(currentIp, currentPort)
-                {
-                    ConnectTimeoutMs = settings.GetValue<int?>("ConnectTimeoutMs") ?? 3000,
-                    IoTimeoutMs       = settings.GetValue<int?>("IoTimeoutMs")     ?? 3000
-                };
-
-                try
-                {
-                    await client.ConnectAsync();
-                    Log($"'{currentIp}:{currentPort}' adresine yeniden bağlantı başarılı.", ConsoleColor.Green);
-                    oldValues = null;
-                }
-                catch (Exception ex)
-                {
-                    Log($"Yeni parametrelerle bağlantı kurulamadı: {ex.Message}", ConsoleColor.Red);
-                    continue;
-                }
-            }
-
-            try
-            {
-                // DataType değiştiyse eleman başına register boyutu (1/2/4) yeniden hesaplanıyor.
-                int liveRegisterSize = GetRegisterSizeForDataType(liveDataType);
-
-                // Tampon boyutu artık Quantity * registerSizePerItem; Quantity veya DataType
-                // değiştiğinde tampon yeniden boyutlandırılıyor (nadir olay, her tick değil).
-                int requiredLength = Math.Max(1, liveQuantity) * liveRegisterSize;
-                if (readBuffer.Length != requiredLength)
-                {
-                    readBuffer = new ushort[requiredLength];
-                    oldValues = null;
-                }
-
-                await client.ReadHoldingRegistersAsync(liveSlaveId, liveStartAddress, readBuffer);
-
-                if (lastLoggedError != null)
-                {
-                    Log("[RECOVERY] Driver successfully recovered from previous errors. Data stream is back to normal.", ConsoleColor.Cyan);
-                    lastLoggedError = null;
-                }
-
-                bool layoutChanged = oldValues == null ||
-                                     oldValues.Length != readBuffer.Length ||
-                                     oldStartAddress != liveStartAddress ||
-                                     lastKnownDataType != liveDataType;
-
-                string? changeLog = layoutChanged
-                    ? BuildFullChangeLog(readBuffer, liveStartAddress, liveDataType, liveRegisterSize)
-                    : BuildDiffChangeLog(oldValues!, readBuffer, liveStartAddress, liveDataType, liveRegisterSize);
-
-                if (changeLog != null)
-                {
-                    Log($"[DATA CHANGED - Cycle #{cycleCounter}] -> {changeLog}", ConsoleColor.Green);
-                    
-                    // Bellek koruması: Klonlamayı SADECE veri gerçekten değiştiğinde 
-                    // veya ilk bağlantı/layout değişimi anında yapıyoruz!
-                    oldValues = (ushort[])readBuffer.Clone();
-                    oldStartAddress = liveStartAddress;
-                    lastKnownDataType = liveDataType;
-                    lastKnownRegisterSize = liveRegisterSize;
-                }
-                else if (cycleCounter % 100 == 0)
-                {
-                    Log($"[HEARTBEAT - Cycle #{cycleCounter}] Driver alive, data stream stable.", ConsoleColor.DarkGray);
-                }
-
-                
-            }
-            catch (ModbusProtocolException ex)
-            {
-                if (cts.Token.IsCancellationRequested) break;
-
-                string errorMessage = $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}";
-
-                if (lastLoggedError != errorMessage)
-                {
-                    Log(errorMessage, ConsoleColor.Red);
-                    lastLoggedError = errorMessage;
-                }
-            }
-            catch (ModbusTimeoutException ex)
-            {
-                if (cts.Token.IsCancellationRequested) break;
-
-                string errorMessage = $"ZAMAN AŞIMI: {ex.Message}";
-
-                if (lastLoggedError != errorMessage)
-                {
-                    Log(errorMessage, ConsoleColor.Red);
-                    lastLoggedError = errorMessage;
-                }
-
-                oldValues = null;
-
-                bool reconnected = await TryReconnectAsync();
-                if (!reconnected)
-                {
-                    Log("Yeniden bağlanma denemeleri tükendi, uygulama kapatılıyor.", ConsoleColor.Red);
-                    break;
-                }
-            }
-            catch (ModbusConnectionException ex)
-            {
-                if (cts.Token.IsCancellationRequested) break;
-
-                string errorMessage = $"BAĞLANTI HATASI: {ex.Message}";
-
-                if (lastLoggedError != errorMessage)
-                {
-                    Log(errorMessage, ConsoleColor.Red);
-                    lastLoggedError = errorMessage;
-                }
-
-                oldValues = null;
-
-                bool reconnected = await TryReconnectAsync();
-                if (!reconnected)
-                {
-                    Log("Yeniden bağlanma denemeleri tükendi, uygulama kapatılıyor.", ConsoleColor.Red);
-                    break;
-                }
-            }
-            catch (Exception ex)
-            {
-                if (cts.Token.IsCancellationRequested) break;
-
-                string errorMessage = $"BEKLENMEYEN HATA: {ex.Message}";
-
-                if (lastLoggedError != errorMessage)
-                {
-                    Log(errorMessage, ConsoleColor.Red);
-                    lastLoggedError = errorMessage;
-                }
             }
         }
     }
     finally
     {
-        timer.Dispose();
         client.Disconnect();
         Log("Bağlantı kapatıldı, uygulama sonlandırıldı.", ConsoleColor.Cyan);
     }
 
     // ---------------------------------------------------------
-    // YARDIMCI YEREL METOTLAR (Non-static: dış kapsamdaki değişkenleri/config'i
-    // closure ile yakalayabilmek için CS8421 hatasından kaçınmak amacıyla static değildir)
+    // YARDIMCI YEREL METOTLAR
     // ---------------------------------------------------------
 
     /// <summary>
-    /// Seçili veri tipinin tek bir değeri ifade etmek için kaç register (word) kapladığını döndürür.
-    /// WinForms tarafındaki GetRegisterSizeForDataType ile birebir aynı mantık.
+    /// Cihaza bağlantı kurulana kadar (veya Ctrl+C gelene kadar) 5 saniye aralıklarla dener.
+    /// Her denemeden ÖNCE IP/Port bilgisini appsettings.json'dan CANLI okur; böylece sürücü
+    /// henüz hiç bağlanamamışken bile kullanıcı config'i düzeltirse bir sonraki denemede
+    /// otomatik olarak taze adrese yönelir (tavuk-yumurta kilidi çözülür).
     /// </summary>
-    /*
-    ===================================================================
-    DESTEKLENEN MODBUS DATA TYPE (VERİ TİPİ) SEÇENEKLERİ
-        ===================================================================
-    Aşağıdaki metinler appsettings.json içerisindeki "DataType" alanına 
-    birebir (büyük/küçük harf duyarlı) yazılarak kullanılmalıdır:
+    async Task<bool> EstablishConnectionAsync()
+    {
+        while (!cts.Token.IsCancellationRequested)
+        {
+            try
+            {
+                string liveIp   = settings.GetValue<string>("TargetIp")   ?? currentIp;
+                int    livePort = settings.GetValue<int?>("TargetPort")   ?? currentPort;
 
-    - "Unsigned (16-bit)"       -> Standart 1 word ham register (0 - 65535)
-        - "Signed (16-bit)"         -> İşaretli 1 word register (-32768 - 32767)
-        - "Hex"                     -> 16'lık tabanda gösterim (Örn: A4F2)
-        - "Binary"                  -> 16-bit ikilik taban gösterimi (Örn: 1010...)
-    - "Float (32-bit)"          -> 2 word Big-Endian Float
-        - "Float Inverse (32-bit)"  -> 2 word Little-Endian Float
-        - "Long (32-bit)"           -> 2 word Big-Endian 32-bit Integer
-        - "Long Inverse (32-bit)"   -> 2 word Little-Endian 32-bit Integer
-        - "Double (64-bit)"         -> 4 word Big-Endian 64-bit Float
-        - "Double Inverse (64-bit)" -> 4 word Little-Endian 64-bit Float
-        ===================================================================
-    */
+                if (liveIp != currentIp || livePort != currentPort)
+                {
+                    Log($"Bağlantı beklerken parametreler değişti: '{currentIp}:{currentPort}' -> '{liveIp}:{livePort}'. Yeni hedef deneniyor.", ConsoleColor.Cyan);
+                    client.Disconnect();
+
+                    currentIp = liveIp;
+                    currentPort = livePort;
+
+                    client = new ModbusClient(currentIp, currentPort)
+                    {
+                        ConnectTimeoutMs = settings.GetValue<int?>("ConnectTimeoutMs") ?? 3000,
+                        IoTimeoutMs       = settings.GetValue<int?>("IoTimeoutMs")     ?? 3000
+                    };
+                }
+
+                await client.ConnectAsync();
+                Log($"'{currentIp}:{currentPort}' adresine bağlantı başarılı.", ConsoleColor.Green);
+                return true;
+            }
+            catch (ModbusConnectionException ex)
+            {
+                Log($"BAĞLANTI HATASI: {ex.Message} — 5 saniye sonra tekrar denenecek.", ConsoleColor.Red);
+            }
+            catch (ModbusTimeoutException ex)
+            {
+                Log($"BAĞLANTI ZAMAN AŞIMI: {ex.Message} — 5 saniye sonra tekrar denenecek.", ConsoleColor.Red);
+            }
+            catch (Exception ex)
+            {
+                Log($"BEKLENMEYEN BAĞLANTI HATASI: {ex.Message} — 5 saniye sonra tekrar denenecek.", ConsoleColor.Red);
+            }
+
+            try
+            {
+                await Task.Delay(5000, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
     int GetRegisterSizeForDataType(string dataType)
     {
         return dataType switch
@@ -300,10 +334,6 @@ using ModbusTester.Core.Protocol;
         };
     }
 
-    /// <summary>
-    /// Tek bir register grubunun (1/2/4 register) seçili veri tipine göre görüntülenecek değerini
-    /// hesaplar. AsSpan ile dilimleme yapıldığı için heap allocation oluşmaz.
-    /// </summary>
     string GetRegisterDisplayValue(ushort[] registers, string dataType, int i, int registerSizePerItem)
     {
         switch (dataType)
@@ -332,10 +362,6 @@ using ModbusTester.Core.Protocol;
         }
     }
 
-    /// <summary>
-    /// İlk okuma (veya layout değişikliği) durumunda TÜM değerleri, seçili veri tipine göre
-    /// çözümleyip [Adres: Değer] formatında listeler.
-    /// </summary>
     string BuildFullChangeLog(ushort[] registers, ushort startAddress, string dataType, int registerSizePerItem)
     {
         var sb = new StringBuilder();
@@ -350,11 +376,6 @@ using ModbusTester.Core.Protocol;
         return sb.ToString().TrimEnd();
     }
 
-    /// <summary>
-    /// Önceki okuma ile şimdiki okumayı BLOK BAZINDA (registerSizePerItem adımlarla) karşılaştırır;
-    /// yalnızca gerçekten değişen blokları [Adres: EskiDeğer -> YeniDeğer] formatında filtreler.
-    /// Hiçbir blok değişmediyse null döner.
-    /// </summary>
     string? BuildDiffChangeLog(ushort[] oldRegisters, ushort[] newRegisters, ushort startAddress, string dataType, int registerSizePerItem)
     {
         var sb = new StringBuilder();
@@ -362,7 +383,6 @@ using ModbusTester.Core.Protocol;
 
         for (int i = 0; i < newRegisters.Length; i += registerSizePerItem)
         {
-            // Bloktaki ham register'lar değişti mi diye Span üzerinden, allocation'sız karşılaştırıyoruz.
             ReadOnlySpan<ushort> oldSlice = oldRegisters.AsSpan(i, registerSizePerItem);
             ReadOnlySpan<ushort> newSlice = newRegisters.AsSpan(i, registerSizePerItem);
 
@@ -416,4 +436,4 @@ using ModbusTester.Core.Protocol;
         Console.ForegroundColor = color;
         Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
         Console.ResetColor();
-    }
+}
