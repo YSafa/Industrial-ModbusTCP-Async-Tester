@@ -104,9 +104,21 @@ namespace ModbusTester
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold), ForeColor = Color.Gray
             };
 
-            var colAddress = new DataGridViewTextBoxColumn { HeaderText = "Address", Name = "colAddress", ReadOnly = true };
-            var colValue   = new DataGridViewTextBoxColumn { HeaderText = "Value", Name = "colValue", ReadOnly = true };
-
+            var colAddress = new DataGridViewTextBoxColumn
+            {
+                HeaderText = "Address",
+                Name = "colAddress",
+                ReadOnly = true,
+                SortMode = DataGridViewColumnSortMode.NotSortable // Header click no longer triggers sorting.
+            };
+            var colValue = new DataGridViewTextBoxColumn
+            {
+                HeaderText = "Value",
+                Name = "colValue",
+                ReadOnly = true,
+                SortMode = DataGridViewColumnSortMode.NotSortable
+            };
+            
             session.Dgv = new DataGridView
             {
                 Location = new Point(12, 315),
