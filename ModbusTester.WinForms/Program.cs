@@ -1,20 +1,20 @@
 ﻿using System;
 using System.Windows.Forms;
 
-namespace ModbusTester.WinForms
+namespace ModbusTester
 {
     static class Program
     {
         /// <summary>
-        /// Uygulamanın ana giriş noktası.
+        /// The application's main entry point.
         /// </summary>
         [STAThread]
         static void Main()
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            
-            // İşte sihirli satır burası; Windows'a MainForm'u ekrana çizmesini söylüyoruz.
+
+            // This is the key line — it tells Windows to render MainForm on screen.
             Application.Run(new MainForm());
         }
     }

@@ -20,15 +20,14 @@ namespace ModbusTester
         private readonly ushort[]?       _currentValues;
         private readonly bool[]?         _currentBitValues;
 
-        // Dinamik kontroller — yalnızca ilgili mod aktifken null değildir.
-        private CheckBox[]? _bitCheckBoxes; // Binary modu: 16 CheckBox
-        private CheckBox?   _coilCheckBox;  // Coil modu: tek CheckBox
-        private TextBox?    _txtValue;       // Sayısal/Hex modu: metin kutusu
+        // Dynamic controls — non-null only while the corresponding mode is active.
+        private CheckBox[]? _bitCheckBoxes; // Binary mode: 16 CheckBoxes
+        private CheckBox?   _coilCheckBox;  // Coil mode: single CheckBox
+        private TextBox?    _txtValue;       // Numeric/Hex mode: text input
 
-        
         /// <summary>
-        /// Başarılı yazma sonrasında MainForm'un log paneline yeşil satır düşürmesi için
-        /// dışarıdan bağlanan callback delegate.
+        /// Callback invoked by MainForm to append a green log line to its own log panel
+        /// after a successful write.
         /// </summary>
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -43,8 +42,8 @@ namespace ModbusTester
             ushort[]?           currentValues,
             bool[]?             currentBitValues)
         {
-            // Alanlar InitializeComponent'den ÖNCE atanmalıdır;
-            // BuildDynamicUi içindeki pre-fill işlemleri bu değerlere bağlıdır.
+            // Fields must be assigned BEFORE InitializeComponent; pre-fill logic in
+            // BuildDynamicUi depends on these values.
             _client           = client;
             _slaveId          = slaveId;
             _address          = address;
@@ -55,23 +54,23 @@ namespace ModbusTester
 
             InitializeComponent();
 
-            // Header bilgisini alanlar atandıktan sonra güvenle dolduruyoruz.
-            lblInfo.Text = $"Adres: {_address}    |    Veri Tipi: {_dataType}" +
-                           $"\nFonksiyon: {_functionCode}    |    Slave ID: {_slaveId}";
+            // Safe to populate the header text now that fields are assigned.
+            lblInfo.Text = $"Address: {_address}    |    Data Type: {_dataType}" +
+                           $"\nFunction: {_functionCode}    |    Slave ID: {_slaveId}";
 
-            // Salt okunur fonksiyon kodlarında yazmayı devre dışı bırakıyoruz.
+            // Disable writing for read-only function codes.
             if (_functionCode == ModbusFunctionCode.ReadDiscreteInputs ||
                 _functionCode == ModbusFunctionCode.ReadInputRegisters)
             {
                 btnWrite.Enabled  = false;
-                lblInfo.Text     += "\n⚠ Bu alan salt okunurdur; yazma işlemi desteklenmez.";
+                lblInfo.Text     += "\n⚠ This is a read-only register; writing is not supported.";
             }
 
             BuildDynamicUi();
         }
 
         // ---------------------------------------------------------
-        // DİNAMİK UI İNŞASI
+        // DYNAMIC UI CONSTRUCTION
         // ---------------------------------------------------------
 
         private void BuildDynamicUi()
@@ -94,13 +93,13 @@ namespace ModbusTester
         }
 
         /// <summary>
-        /// FC01/FC02 modu: tek bir CheckBox ile coil durumunu gösterir/yönetir.
+        /// FC01/FC02 mode: a single CheckBox to display/control the coil state.
         /// </summary>
         private void BuildCoilUi()
         {
             _coilCheckBox = new CheckBox
             {
-                Text     = "Açık  (1)  /  Kapalı  (0)",
+                Text     = "On  (1)  /  Off  (0)",
                 Location = new Point(20, 75),
                 AutoSize = true,
                 Font     = new Font("Segoe UI", 10f)
@@ -115,8 +114,8 @@ namespace ModbusTester
         }
 
         /// <summary>
-        /// Binary modu: 16 adet CheckBox ile tek bir register'ın her bitini ayrı ayrı gösterir.
-        /// Kutucuklar MSB (B15) soldan başlayacak şekilde 8+8 satır halinde dizilir.
+        /// Binary mode: 16 CheckBoxes representing each bit of a single register.
+        /// Boxes are laid out MSB (B15) first, in two rows of 8.
         /// </summary>
         private void BuildBinaryUi()
         {
@@ -126,7 +125,6 @@ namespace ModbusTester
                 ? _currentValues[0]
                 : (ushort)0;
 
-            // Bit etiketleri başlığı
             var lblBits = new Label
             {
                 Text      = "B15 → B8                              B7 → B0",
@@ -139,7 +137,7 @@ namespace ModbusTester
 
             for (int i = 0; i < 16; i++)
             {
-                int bitIndex = 15 - i; // Soldan sağa: B15 → B0
+                int bitIndex = 15 - i; // Left to right: B15 → B0
                 int col      = i % 8;
                 int row      = i / 8;
 
@@ -163,13 +161,13 @@ namespace ModbusTester
         }
 
         /// <summary>
-        /// Sayısal/Hex modu: klavye filtreli tek bir TextBox ile değer girişi sağlar.
+        /// Numeric/Hex mode: a single TextBox with keystroke filtering for value entry.
         /// </summary>
         private void BuildTextUi()
         {
             var lblInput = new Label
             {
-                Text     = "Yazılacak Değer:",
+                Text     = "Value to Write:",
                 Location = new Point(20, 72),
                 AutoSize = true,
                 Font     = new Font("Segoe UI", 9f)
@@ -184,27 +182,19 @@ namespace ModbusTester
 
             _txtValue.Text      = GetCurrentValueAsString();
             _txtValue.KeyPress += TxtValue_KeyPress;
-            
-            _txtValue.KeyDown += (sender, e) =>
-            {
-                if (e.KeyCode == Keys.Enter)
-                {
-                    e.SuppressKeyPress = true; 
-                    BtnWrite_Click(sender, e);
-                }
-            };
+            _txtValue.KeyDown  += TxtValue_KeyDown;
 
             this.Controls.Add(lblInput);
             this.Controls.Add(_txtValue);
-            
-            this.ActiveControl = _txtValue;
-            
             this.ClientSize = new Size(300, 175);
             RepositionButtons(130);
+
+            // Auto-focus: cursor lands directly in the text box as soon as the form opens.
+            this.ActiveControl = _txtValue;
         }
 
         /// <summary>
-        /// Butonları form boyutu netleştikten sonra doğru Y konumuna taşır.
+        /// Repositions the buttons once the final form height is known.
         /// </summary>
         private void RepositionButtons(int y)
         {
@@ -213,7 +203,7 @@ namespace ModbusTester
         }
 
         // ---------------------------------------------------------
-        // MEVCUT DEĞERİ METİNE DÖNÜŞTÜRME
+        // FORMATTING THE CURRENT VALUE AS TEXT
         // ---------------------------------------------------------
 
         private string GetCurrentValueAsString()
@@ -238,12 +228,12 @@ namespace ModbusTester
         }
 
         // ---------------------------------------------------------
-        // KLAVYE FİLTRELEME (KeyPress Masking)
+        // KEYSTROKE FILTERING (KeyPress Masking)
         // ---------------------------------------------------------
 
         private void TxtValue_KeyPress(object? sender, KeyPressEventArgs e)
         {
-            if (char.IsControl(e.KeyChar)) return; // Backspace, Delete vb. her zaman geçer.
+            if (char.IsControl(e.KeyChar)) return; // Backspace, Delete, etc. always pass through.
 
             string current   = _txtValue?.Text ?? "";
             int    cursorPos = _txtValue?.SelectionStart ?? 0;
@@ -251,19 +241,19 @@ namespace ModbusTester
             switch (_dataType)
             {
                 case "Hex":
-                    // Yalnızca 0-9, A-F, a-f karakterlerine izin ver.
+                    // Only 0-9, A-F, a-f are allowed.
                     if (!IsHexChar(e.KeyChar)) e.Handled = true;
                     break;
 
                 case "Unsigned (16-bit)":
-                    // Yalnızca rakam.
+                    // Digits only.
                     if (!char.IsDigit(e.KeyChar)) e.Handled = true;
                     break;
 
                 case "Signed (16-bit)":
                 case "Long (32-bit)":
                 case "Long Inverse (32-bit)":
-                    // Rakam + en başta tek eksi işareti.
+                    // Digits plus a single leading minus sign.
                     if (!char.IsDigit(e.KeyChar))
                     {
                         bool isLeadingMinus = e.KeyChar == '-' && cursorPos == 0 && !current.Contains('-');
@@ -275,7 +265,7 @@ namespace ModbusTester
                 case "Float Inverse (32-bit)":
                 case "Double (64-bit)":
                 case "Double Inverse (64-bit)":
-                    // Rakam + tek eksi + tek ondalık ayracı (, veya .)
+                    // Digits, a single leading minus, and a single decimal separator (. or ,).
                     if (!char.IsDigit(e.KeyChar))
                     {
                         bool isLeadingMinus   = e.KeyChar == '-' && cursorPos == 0 && !current.Contains('-');
@@ -287,16 +277,29 @@ namespace ModbusTester
             }
         }
 
+        /// <summary>
+        /// Lets the user press Enter to submit the write directly, instead of forcing a click on
+        /// the Write button. Suppresses the keystroke to avoid the Windows error beep.
+        /// </summary>
+        private void TxtValue_KeyDown(object? sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.SuppressKeyPress = true;
+                BtnWrite_Click(sender, EventArgs.Empty);
+            }
+        }
+
         private static bool IsHexChar(char c)
             => (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
 
         // ---------------------------------------------------------
-        // YAZMA BUTONU
+        // WRITE BUTTON
         // ---------------------------------------------------------
 
         private async void BtnWrite_Click(object? sender, EventArgs e)
         {
-            btnWrite.Enabled = false; // Çift tıklamayı ve paralel yazma denemelerini engelle.
+            btnWrite.Enabled = false; // Prevent double-clicks and overlapping write attempts.
 
             try
             {
@@ -312,22 +315,22 @@ namespace ModbusTester
             }
             catch (ModbusProtocolException ex)
             {
-                MessageBox.Show($"Protokol hatası: {ex.Message}", "Yazma Hatası",
+                MessageBox.Show($"Protocol error: {ex.Message}", "Write Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (ModbusConnectionException ex)
             {
-                MessageBox.Show($"Bağlantı hatası: {ex.Message}", "Yazma Hatası",
+                MessageBox.Show($"Connection error: {ex.Message}", "Write Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (ModbusTimeoutException ex)
             {
-                MessageBox.Show($"Zaman aşımı: {ex.Message}", "Yazma Hatası",
+                MessageBox.Show($"Timeout: {ex.Message}", "Write Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Beklenmeyen hata: {ex.Message}", "Yazma Hatası",
+                MessageBox.Show($"Unexpected error: {ex.Message}", "Write Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
@@ -337,7 +340,7 @@ namespace ModbusTester
         }
 
         // ---------------------------------------------------------
-        // MOD BAZLI YAZMA METOTLARI
+        // PER-MODE WRITE METHODS
         // ---------------------------------------------------------
 
         private async System.Threading.Tasks.Task WriteCoilAsync()
@@ -346,7 +349,7 @@ namespace ModbusTester
 
             bool value = _coilCheckBox.Checked;
             await _client.WriteSingleCoilAsync(_slaveId, _address, value);
-            HandleSuccess($"[FC05] Coil {_address} → {(value ? "1 (Açık)" : "0 (Kapalı)")} yazıldı.");
+            HandleSuccess($"[FC05] Coil {_address} → {(value ? "1 (On)" : "0 (Off)")} written.");
         }
 
         private async System.Threading.Tasks.Task WriteBinaryAsync()
@@ -356,18 +359,19 @@ namespace ModbusTester
             ushort result = 0;
             for (int i = 0; i < 16; i++)
             {
-                int bitIndex = 15 - i; // B15 solda, B0 sağda
+                int bitIndex = 15 - i; // B15 on the left, B0 on the right
                 if (_bitCheckBoxes[i].Checked)
                     result |= (ushort)(1 << bitIndex);
             }
 
             await _client.WriteSingleRegisterAsync(_slaveId, _address, result);
-            HandleSuccess($"[FC06] Register {_address} → 0b{Convert.ToString(result, 2).PadLeft(16, '0')} yazıldı.");
+            HandleSuccess($"[FC06] Register {_address} → 0b{Convert.ToString(result, 2).PadLeft(16, '0')} written.");
         }
 
         private async System.Threading.Tasks.Task WriteValueAsync()
         {
-            // Virgülü noktaya çevirip InvariantCulture ile parse ediyoruz; Türkçe Windows'ta "," decimal ayracıdır.
+            // Comma is converted to a period and parsed with InvariantCulture, since a Turkish
+            // Windows locale would otherwise treat "," as the decimal separator.
             string input = (_txtValue?.Text ?? "").Replace(',', '.');
 
             switch (_dataType)
@@ -377,7 +381,7 @@ namespace ModbusTester
                     if (!ushort.TryParse(input, out ushort val))
                     { ShowRangeError("Unsigned 16-bit", "0", "65535"); return; }
                     await _client.WriteSingleRegisterAsync(_slaveId, _address, val);
-                    HandleSuccess($"[FC06] Register {_address} → {val} yazıldı.");
+                    HandleSuccess($"[FC06] Register {_address} → {val} written.");
                     break;
                 }
 
@@ -386,16 +390,16 @@ namespace ModbusTester
                     if (!short.TryParse(input, out short val))
                     { ShowRangeError("Signed 16-bit", "-32768", "32767"); return; }
                     await _client.WriteSingleRegisterAsync(_slaveId, _address, unchecked((ushort)val));
-                    HandleSuccess($"[FC06] Register {_address} → {val} yazıldı.");
+                    HandleSuccess($"[FC06] Register {_address} → {val} written.");
                     break;
                 }
 
                 case "Hex":
                 {
                     if (!ushort.TryParse(input, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ushort val))
-                    { MessageBox.Show("Geçersiz hex değeri. Örnek: 1A2B", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    { MessageBox.Show("Invalid hex value. Example: 1A2B", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
                     await _client.WriteSingleRegisterAsync(_slaveId, _address, val);
-                    HandleSuccess($"[FC06] Register {_address} → 0x{val:X4} yazıldı.");
+                    HandleSuccess($"[FC06] Register {_address} → 0x{val:X4} written.");
                     break;
                 }
 
@@ -404,11 +408,12 @@ namespace ModbusTester
                 {
                     if (!float.TryParse(input, NumberStyles.Float, CultureInfo.InvariantCulture, out float val))
                     { ShowRangeError("Float 32-bit", float.MinValue.ToString("G"), float.MaxValue.ToString("G")); return; }
-                    // Okuma inverse kuralının tersi: "Float (32-bit)" inverse:true okur → yazarken de swap uygulanır.
+                    // Inverse of the read convention: "Float (32-bit)" reads with inverse:true,
+                    // so writing uses the same swap.
                     bool inverse  = _dataType == "Float (32-bit)";
                     ushort[] regs = FloatToRegisters(val, inverse);
                     await _client.WriteMultipleRegistersAsync(_slaveId, _address, regs);
-                    HandleSuccess($"[FC16] Register {_address}-{_address + 1} → {val} yazıldı.");
+                    HandleSuccess($"[FC16] Register {_address}-{_address + 1} → {val} written.");
                     break;
                 }
 
@@ -420,7 +425,7 @@ namespace ModbusTester
                     bool inverse  = _dataType == "Long (32-bit)";
                     ushort[] regs = LongToRegisters(val, inverse);
                     await _client.WriteMultipleRegistersAsync(_slaveId, _address, regs);
-                    HandleSuccess($"[FC16] Register {_address}-{_address + 1} → {val} yazıldı.");
+                    HandleSuccess($"[FC16] Register {_address}-{_address + 1} → {val} written.");
                     break;
                 }
 
@@ -432,21 +437,21 @@ namespace ModbusTester
                     bool inverse  = _dataType == "Double (64-bit)";
                     ushort[] regs = DoubleToRegisters(val, inverse);
                     await _client.WriteMultipleRegistersAsync(_slaveId, _address, regs);
-                    HandleSuccess($"[FC16] Register {_address}-{_address + 3} → {val} yazıldı.");
+                    HandleSuccess($"[FC16] Register {_address}-{_address + 3} → {val} written.");
                     break;
                 }
             }
         }
 
         // ---------------------------------------------------------
-        // DEĞER → REGISTER DİZİSİ DÖNÜŞTÜRÜCÜLER
-        // Okuma mantığının tam tersi: ModbusDataConverter.ToFloat/ToLong/ToDouble metodlarının simetriği.
+        // VALUE → REGISTER ARRAY CONVERTERS
+        // Exact inverse of the read path: mirrors ModbusDataConverter.ToFloat/ToLong/ToDouble.
         // ---------------------------------------------------------
 
         /// <summary>
         /// float → ushort[2].
-        /// inverse=true ("Float 32-bit" modu): okuma sırasında registers[0]=lowWord, registers[1]=highWord idi;
-        /// yazdığımızda da aynı swap uygulanır.
+        /// inverse=true ("Float 32-bit" mode): on read, registers[0]=lowWord, registers[1]=highWord;
+        /// the same swap is applied when writing.
         /// </summary>
         private static ushort[] FloatToRegisters(float value, bool inverse)
         {
@@ -466,8 +471,8 @@ namespace ModbusTester
 
         /// <summary>
         /// double → ushort[4].
-        /// inverse=true ("Double 64-bit" modu): okuma sırasında w0=registers[3],...,w3=registers[0] idi;
-        /// yazdığımızda registers[0]=w3, registers[1]=w2, registers[2]=w1, registers[3]=w0 olur.
+        /// inverse=true ("Double 64-bit" mode): on read, w0=registers[3], ..., w3=registers[0];
+        /// when writing, registers[0]=w3, registers[1]=w2, registers[2]=w1, registers[3]=w0.
         /// </summary>
         private static ushort[] DoubleToRegisters(double value, bool inverse)
         {
@@ -480,12 +485,11 @@ namespace ModbusTester
         }
 
         // ---------------------------------------------------------
-        // YARDIMCI METOTLAR
+        // HELPERS
         // ---------------------------------------------------------
 
         private void HandleSuccess(string message)
         {
-            // Callback üzerinden MainForm'un log paneline yeşil satır düşürüyoruz.
             OnSuccessLog?.Invoke(message);
             this.DialogResult = DialogResult.OK;
             this.Close();
@@ -494,8 +498,8 @@ namespace ModbusTester
         private void ShowRangeError(string typeName, string min, string max)
         {
             MessageBox.Show(
-                $"Girilen değer {typeName} sınırları dışında.\nGeçerli aralık: {min}  →  {max}",
-                "Sınır Aşımı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                $"The entered value is outside the range of {typeName}.\nValid range: {min}  →  {max}",
+                "Range Exceeded", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void BtnCancel_Click(object? sender, EventArgs e)

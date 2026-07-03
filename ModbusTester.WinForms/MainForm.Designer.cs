@@ -20,13 +20,13 @@ namespace ModbusTester
             this.pnlTop.SuspendLayout();
             this.SuspendLayout();
 
-            // --- pnlTop (üst kontrol çubuğu) ---
+            // --- pnlTop (top control bar) ---
             this.pnlTop.Dock   = System.Windows.Forms.DockStyle.Top;
             this.pnlTop.Height = 44;
             this.pnlTop.Controls.Add(this.btnAddTab);
 
             // --- btnAddTab ---
-            this.btnAddTab.Text     = "Yeni Sekme Ekle";
+            this.btnAddTab.Text     = "Add New Tab";
             this.btnAddTab.Location = new System.Drawing.Point(10, 8);
             this.btnAddTab.Size     = new System.Drawing.Size(150, 28);
             this.btnAddTab.UseVisualStyleBackColor = true;
@@ -41,7 +41,7 @@ namespace ModbusTester
             this.Controls.Add(this.pnlTop);
             this.ClientSize   = new System.Drawing.Size(500, 760);
             this.Name         = "MainForm";
-            this.Text         = "Modbus TCP Master Tester — Sekmeli";
+            this.Text         = "Modbus TCP Master Tester";
             this.FormClosing += new System.Windows.Forms.FormClosingEventHandler(this.MainForm_FormClosing);
 
             this.pnlTop.ResumeLayout(false);

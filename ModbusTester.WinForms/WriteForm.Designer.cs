@@ -24,21 +24,21 @@ namespace ModbusTester
             this.lblInfo.Name      = "lblInfo";
             this.lblInfo.Size      = new System.Drawing.Size(450, 55);
             this.lblInfo.Font      = new System.Drawing.Font("Segoe UI", 9f);
-            this.lblInfo.Text      = ""; // Constructor'da dinamik olarak doldurulacak.
+            this.lblInfo.Text      = ""; // Populated dynamically in the constructor.
 
             // --- btnWrite ---
             this.btnWrite.Name               = "btnWrite";
-            this.btnWrite.Text               = "Yaz";
+            this.btnWrite.Text               = "Write";
             this.btnWrite.Size               = new System.Drawing.Size(90, 28);
-            this.btnWrite.Location           = new System.Drawing.Point(12, 130); // BuildDynamicUi tarafından yeniden konumlandırılacak.
+            this.btnWrite.Location           = new System.Drawing.Point(12, 130); // Repositioned by BuildDynamicUi.
             this.btnWrite.UseVisualStyleBackColor = true;
             this.btnWrite.Click             += new System.EventHandler(this.BtnWrite_Click);
 
             // --- btnCancel ---
             this.btnCancel.Name               = "btnCancel";
-            this.btnCancel.Text               = "İptal";
+            this.btnCancel.Text               = "Cancel";
             this.btnCancel.Size               = new System.Drawing.Size(90, 28);
-            this.btnCancel.Location           = new System.Drawing.Point(115, 130); // BuildDynamicUi tarafından yeniden konumlandırılacak.
+            this.btnCancel.Location           = new System.Drawing.Point(115, 130); // Repositioned by BuildDynamicUi.
             this.btnCancel.UseVisualStyleBackColor = true;
             this.btnCancel.Click             += new System.EventHandler(this.BtnCancel_Click);
 
@@ -49,7 +49,7 @@ namespace ModbusTester
             this.MaximizeBox     = false;
             this.MinimizeBox     = false;
             this.StartPosition   = System.Windows.Forms.FormStartPosition.CenterParent;
-            this.Text            = "Değer Yaz";
+            this.Text            = "Write Value";
             this.ClientSize      = new System.Drawing.Size(300, 175);
             this.ResumeLayout(false);
         }

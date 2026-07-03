@@ -30,17 +30,21 @@ namespace ModbusTester
         private const int ReconnectDelayMs     = 2000;
 
         private enum ConnectionPhase { Idle, Searching, Connected, DataError, Reconnecting }
-        
+
         public MainForm()
         {
             InitializeComponent();
-            CreateAndAddSession("Ana Cihaz", closable: false);
+            CreateAndAddSession("Main Device", closable: false);
         }
+
+        // ---------------------------------------------------------
+        // ADD TAB
+        // ---------------------------------------------------------
 
         private void BtnAddTab_Click(object? sender, EventArgs e)
         {
             string tabName = Interaction.InputBox(
-                "Yeni sekme için bir isim girin:", "Sekme Adı", $"Cihaz {_dynamicTabCounter + 1}");
+                "Enter a name for the new tab:", "Tab Name", $"Device {_dynamicTabCounter + 1}");
             if (string.IsNullOrWhiteSpace(tabName)) return;
 
             _dynamicTabCounter++;
@@ -55,12 +59,16 @@ namespace ModbusTester
             tabControl.SelectedTab = session.Page;
         }
 
+        // ---------------------------------------------------------
+        // PER-TAB UI CONSTRUCTION
+        // ---------------------------------------------------------
+
         private TabSession BuildSession(string tabName, bool closable)
         {
             var page = new TabPage(tabName);
             var session = new TabSession(page);
 
-            var lblIp = new Label { Text = "IP Adresi:", Location = new Point(12, 15), AutoSize = true };
+            var lblIp = new Label { Text = "IP Address:", Location = new Point(12, 15), AutoSize = true };
             session.TxtIp = new TextBox { Location = new Point(130, 12), Size = new Size(150, 20), Text = "127.0.0.1" };
 
             var lblPort = new Label { Text = "Port:", Location = new Point(12, 45), AutoSize = true };
@@ -69,35 +77,35 @@ namespace ModbusTester
             var lblSlaveId = new Label { Text = "Slave ID:", Location = new Point(12, 75), AutoSize = true };
             session.NumSlaveId = new NumericUpDown { Location = new Point(130, 72), Size = new Size(80, 20), Minimum = 1, Maximum = 255, Value = 1 };
 
-            var lblStartAddress = new Label { Text = "Başlangıç Adresi:", Location = new Point(12, 105), AutoSize = true };
+            var lblStartAddress = new Label { Text = "Start Address:", Location = new Point(12, 105), AutoSize = true };
             session.NumStartAddress = new NumericUpDown { Location = new Point(130, 102), Size = new Size(80, 20), Minimum = 0, Maximum = 65535, Value = 0 };
 
-            var lblFunctionCode = new Label { Text = "Fonksiyon Kodu:", Location = new Point(12, 135), AutoSize = true };
+            var lblFunctionCode = new Label { Text = "Function Code:", Location = new Point(12, 135), AutoSize = true };
             session.CmbFunctionCode = new ComboBox { Location = new Point(130, 132), Size = new Size(220, 21), DropDownStyle = ComboBoxStyle.DropDownList };
 
-            var lblDataType = new Label { Text = "Veri Tipi:", Location = new Point(12, 165), AutoSize = true };
+            var lblDataType = new Label { Text = "Data Type:", Location = new Point(12, 165), AutoSize = true };
             session.CmbDataType = new ComboBox { Location = new Point(130, 162), Size = new Size(220, 21), DropDownStyle = ComboBoxStyle.DropDownList };
 
-            var lblQuantity = new Label { Text = "Adet:", Location = new Point(12, 195), AutoSize = true };
+            var lblQuantity = new Label { Text = "Quantity:", Location = new Point(12, 195), AutoSize = true };
             session.NumQuantity = new NumericUpDown { Location = new Point(130, 192), Size = new Size(80, 20), Minimum = 1, Maximum = 500, Value = 1 };
 
-            var lblPollingInterval = new Label { Text = "Sorgulama (ms):", Location = new Point(12, 225), AutoSize = true };
+            var lblPollingInterval = new Label { Text = "Polling (ms):", Location = new Point(12, 225), AutoSize = true };
             session.NumPollingInterval = new NumericUpDown { Location = new Point(130, 222), Size = new Size(80, 20), Minimum = 50, Maximum = 60000, Value = 200 };
 
-            session.BtnConnect = new Button { Text = "Bağlan", Location = new Point(130, 255), Size = new Size(90, 28), UseVisualStyleBackColor = true };
+            session.BtnConnect = new Button { Text = "Connect", Location = new Point(130, 255), Size = new Size(90, 28), UseVisualStyleBackColor = true };
             session.BtnConnect.Click += (s, e) => BtnConnect_Click(session);
 
-            session.BtnStop = new Button { Text = "Durdur", Location = new Point(228, 255), Size = new Size(90, 28), UseVisualStyleBackColor = true, Enabled = false };
+            session.BtnStop = new Button { Text = "Stop", Location = new Point(228, 255), Size = new Size(90, 28), UseVisualStyleBackColor = true, Enabled = false };
             session.BtnStop.Click += (s, e) => BtnStop_Click(session);
 
             session.LblPhase = new Label
             {
-                Text = "Bağlı Değil", Location = new Point(12, 288), Size = new Size(340, 20),
+                Text = "Not Connected", Location = new Point(12, 288), Size = new Size(340, 20),
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold), ForeColor = Color.Gray
             };
 
-            var colAddress = new DataGridViewTextBoxColumn { HeaderText = "Adres", Name = "colAddress", ReadOnly = true };
-            var colValue   = new DataGridViewTextBoxColumn { HeaderText = "Değer", Name = "colValue", ReadOnly = true };
+            var colAddress = new DataGridViewTextBoxColumn { HeaderText = "Address", Name = "colAddress", ReadOnly = true };
+            var colValue   = new DataGridViewTextBoxColumn { HeaderText = "Value", Name = "colValue", ReadOnly = true };
 
             session.Dgv = new DataGridView
             {
@@ -148,7 +156,7 @@ namespace ModbusTester
             {
                 session.BtnCloseTab = new Button
                 {
-                    Text = "Sekmeyi Kapat", Location = new Point(326, 255), Size = new Size(120, 28), UseVisualStyleBackColor = true
+                    Text = "Close Tab", Location = new Point(326, 255), Size = new Size(120, 28), UseVisualStyleBackColor = true
                 };
                 session.BtnCloseTab.Click += (s, e) => CloseSession(session);
                 page.Controls.Add(session.BtnCloseTab);
@@ -163,7 +171,7 @@ namespace ModbusTester
             session.CmbFunctionCode.Items.Clear();
             foreach (var item in _functionCodeItems)
                 session.CmbFunctionCode.Items.Add(item.Display);
-            session.CmbFunctionCode.SelectedIndex = 2;
+            session.CmbFunctionCode.SelectedIndex = 2; // Default: Read Holding Registers (FC03)
 
             session.CmbDataType.Items.Clear();
             session.CmbDataType.Items.AddRange(new object[]
@@ -186,12 +194,25 @@ namespace ModbusTester
 
         private void CmbFunctionCode_SelectedIndexChanged(TabSession session)
         {
+            // Only meaningful while the driver is NOT running (Idle); when Connected/Searching
+            // this control is already locked so the user cannot reach it.
             var fc = GetSelectedFunctionCode(session);
             bool isBitBased = fc == ModbusFunctionCode.ReadCoils || fc == ModbusFunctionCode.ReadDiscreteInputs;
             if (session.CurrentPhase == ConnectionPhase.Idle)
                 session.CmbDataType.Enabled = !isBitBased;
         }
 
+        // ---------------------------------------------------------
+        // PHASE-BASED CONTROL LOCKING
+        // ---------------------------------------------------------
+
+        /// <summary>
+        /// Updates both the status label and the Enabled state of the tab's controls based on
+        /// the driver's current phase (Idle/Searching/Connected/DataError/Reconnecting). This
+        /// eliminates the "Zombie UI" risk while also preventing structural parameters
+        /// (DataType, Quantity, StartAddress, etc.) from being changed mid-poll, which would
+        /// otherwise corrupt the read buffer/grid layout.
+        /// </summary>
         private void SetPhaseSafe(TabSession session, ConnectionPhase phase, string message)
         {
             if (this.InvokeRequired) { this.Invoke(new Action(() => SetPhaseSafe(session, phase, message))); return; }
@@ -202,7 +223,7 @@ namespace ModbusTester
             {
                 ConnectionPhase.Searching    => Color.Orange,
                 ConnectionPhase.Connected    => Color.Green,
-                ConnectionPhase.DataError    => Color.DarkOrange, // Soket sağlam ama son istek reddedildi.
+                ConnectionPhase.DataError    => Color.DarkOrange, // Socket is fine, last request was rejected.
                 ConnectionPhase.Reconnecting => Color.Red,
                 _                            => Color.Gray
             };
@@ -224,6 +245,7 @@ namespace ModbusTester
                     break;
 
                 case ConnectionPhase.Searching:
+                    // Let the user fix a wrong IP/Port; everything else stays locked.
                     session.TxtIp.Enabled = true;
                     session.TxtPort.Enabled = true;
                     session.NumSlaveId.Enabled = false;
@@ -234,7 +256,7 @@ namespace ModbusTester
                     session.CmbDataType.Enabled = false;
                     session.BtnConnect.Enabled = false;
                     session.BtnStop.Enabled = true;
-                    session.Dgv.Enabled = false;
+                    session.Dgv.Enabled = false; // stale data should never look "fresh".
                     break;
 
                 case ConnectionPhase.Connected:
@@ -246,17 +268,16 @@ namespace ModbusTester
                     session.CmbFunctionCode.Enabled = false;
                     session.CmbDataType.Enabled = false;
                     session.BtnConnect.Enabled = false;
-                    session.NumPollingInterval.Enabled = true;
+                    session.NumPollingInterval.Enabled = true; // speed can be adjusted live.
                     session.BtnStop.Enabled = true;
                     session.Dgv.Enabled = true;
                     break;
 
                 case ConnectionPhase.DataError:
-                    // Soket sağlam, kilitleme kuralları Connected ile AYNI (driver hâlâ çalışıyor,
-                    // kullanıcı yapısal parametreleri değiştiremez); sadece görsel uyarı farklı.
-                    // Dgv bilinçli olarak Enabled=true bırakılıyor ama içi boş (ClearGridSafe zaten
-                    // temizledi) — operatör tablonun "aktif ama veri gelmiyor" olduğunu görüyor,
-                    // "pasif/donmuş" ile karıştırmıyor.
+                    // Socket is alive; locking rules are the SAME as Connected (the driver is
+                    // still running). Only the status color/message differs. The grid is left
+                    // Enabled (already cleared by ClearGridSafe) so the operator can see it's
+                    // "active but not receiving data", not "paused".
                     session.TxtIp.Enabled = false;
                     session.TxtPort.Enabled = false;
                     session.NumSlaveId.Enabled = false;
@@ -286,19 +307,23 @@ namespace ModbusTester
             }
         }
 
+        // ---------------------------------------------------------
+        // CONNECT / STOP
+        // ---------------------------------------------------------
+
         private void BtnConnect_Click(TabSession session)
         {
             if (session.DriverTask != null && !session.DriverTask.IsCompleted)
             {
-                LogMessage(session, "Sürücü zaten çalışıyor.", Color.Orange);
+                LogMessage(session, "Driver is already running.", Color.Orange);
                 return;
             }
 
             string ip = session.TxtIp.Text.Trim();
-            if (string.IsNullOrWhiteSpace(ip)) { LogMessage(session, "IP adresi boş olamaz.", Color.Red); return; }
+            if (string.IsNullOrWhiteSpace(ip)) { LogMessage(session, "IP address cannot be empty.", Color.Red); return; }
 
             if (!int.TryParse(session.TxtPort.Text.Trim(), out int port) || port <= 0 || port > 65535)
-            { LogMessage(session, "Geçersiz port numarası.", Color.Red); return; }
+            { LogMessage(session, "Invalid port number.", Color.Red); return; }
 
             session.CurrentIp = ip;
             session.CurrentPort = port;
@@ -307,16 +332,20 @@ namespace ModbusTester
             session.DriverCts = new CancellationTokenSource();
             var token = session.DriverCts.Token;
 
-            SetPhaseSafe(session, ConnectionPhase.Searching, "Cihaz aranıyor...");
+            SetPhaseSafe(session, ConnectionPhase.Searching, "Searching for device...");
             session.DriverTask = Task.Run(() => RunDriverAsync(session, token), token);
         }
 
         private async void BtnStop_Click(TabSession session)
         {
             await StopDriverAsync(session);
-            LogMessage(session, "Sürücü durduruldu.", Color.Orange);
+            LogMessage(session, "Driver stopped.", Color.Orange);
         }
 
+        /// <summary>
+        /// Guarantees the cancel -> await(join) -> dispose sequence. Shared by BtnStop_Click,
+        /// CloseSession, and MainForm_FormClosing.
+        /// </summary>
         private async Task StopDriverAsync(TabSession session)
         {
             session.DriverCts?.Cancel();
@@ -336,9 +365,13 @@ namespace ModbusTester
 
             session.Client?.Disconnect();
 
-            SetPhaseSafe(session, ConnectionPhase.Idle, "Bağlı Değil");
+            SetPhaseSafe(session, ConnectionPhase.Idle, "Not Connected");
             ClearGridSafe(session);
         }
+
+        // ---------------------------------------------------------
+        // DUAL-LOOP ARCHITECTURE (Outer / Inner Loop)
+        // ---------------------------------------------------------
 
         private async Task RunDriverAsync(TabSession session, CancellationToken token)
         {
@@ -347,6 +380,8 @@ namespace ModbusTester
                 bool connected = await EstablishConnectionAsync(session, token);
                 if (!connected) break;
 
+                // Connection is now proven; structural parameters are locked in the Connected
+                // phase, so we read them ONCE and allocate the register buffer once as well.
                 PollingParameters initialParams = GetPollingParametersSafe(session);
                 bool isBitBased = initialParams.FunctionCode == ModbusFunctionCode.ReadCoils ||
                                    initialParams.FunctionCode == ModbusFunctionCode.ReadDiscreteInputs;
@@ -372,9 +407,11 @@ namespace ModbusTester
                     timer.Dispose();
                     session.Timer = null;
                 }
+                // If the inner loop broke (reconnect exhausted), the outer loop restarts and
+                // returns to EstablishConnectionAsync automatically.
             }
 
-            SetPhaseSafe(session, ConnectionPhase.Idle, "Bağlı Değil");
+            SetPhaseSafe(session, ConnectionPhase.Idle, "Not Connected");
         }
 
         private async Task<bool> EstablishConnectionAsync(TabSession session, CancellationToken token)
@@ -391,18 +428,18 @@ namespace ModbusTester
                     session.Client = new ModbusClient(liveIp, livePort) { ConnectTimeoutMs = 3000, IoTimeoutMs = 3000 };
                 }
 
-                SetPhaseSafe(session, ConnectionPhase.Searching, $"Cihaz aranıyor: {session.CurrentIp}:{session.CurrentPort}...");
+                SetPhaseSafe(session, ConnectionPhase.Searching, $"Searching for device: {session.CurrentIp}:{session.CurrentPort}...");
 
                 try
                 {
                     await session.Client!.ConnectAsync();
-                    LogMessage(session, "Bağlantı başarılı.", Color.Green);
-                    SetPhaseSafe(session, ConnectionPhase.Connected, "Veri Akışı Aktif");
+                    LogMessage(session, "Connected successfully.", Color.Green);
+                    SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
                     return true;
                 }
                 catch (Exception ex)
                 {
-                    LogMessage(session, $"Bağlanılamadı: {ex.Message} — 5 sn sonra tekrar denenecek.", Color.Red);
+                    LogMessage(session, $"Could not connect: {ex.Message} — retrying in 5 sec.", Color.Red);
                 }
 
                 try { await Task.Delay(5000, token); }
@@ -420,6 +457,9 @@ namespace ModbusTester
             {
                 PollingParameters parameters = GetPollingParametersSafe(session);
 
+                // NOTE: This block never actually fires in practice while Connected, since
+                // TxtIp/TxtPort are disabled in that phase and the user cannot change them.
+                // Left in place as a defensive fallback in case locking rules are relaxed later.
                 if (parameters.Ip != session.CurrentIp || parameters.Port != session.CurrentPort)
                 {
                     var temp = new ModbusClient(parameters.Ip, parameters.Port) { ConnectTimeoutMs = 3000, IoTimeoutMs = 3000 };
@@ -435,7 +475,7 @@ namespace ModbusTester
                     catch (Exception ex)
                     {
                         temp.Disconnect();
-                        LogMessage(session, $"Beklenmeyen adres değişimi denemesi başarısız: {ex.Message}", Color.Red);
+                        LogMessage(session, $"Unexpected address-change attempt failed: {ex.Message}", Color.Red);
                     }
                 }
 
@@ -445,42 +485,41 @@ namespace ModbusTester
                     session.LastProtocolErrorCode = null;
                     session.LastGeneralErrorMessage = null;
 
-                    // Son okuma başarılıydı; eğer faz zaten Connected DEĞİLSE (yani bir önceki tick'te
-                    // DataError durumundaydıysak), şimdi otomatik olarak yeşile geri dönüyoruz.
-                    // "if" koruması bilinçli: her başarılı tick'te (200ms'de bir) gereksiz Invoke/label
-                    // repaint yapmamak için, yalnızca gerçek bir DURUM DEĞİŞİKLİĞİ olduğunda tetikleniyor.
+                    // Last read succeeded; if the phase is NOT already Connected (i.e. we were
+                    // in DataError on the previous tick), switch back to green automatically.
+                    // The "if" guard is deliberate: on every successful tick (every 200ms) we
+                    // avoid a redundant Invoke/label repaint, only firing on an actual state change.
                     if (session.CurrentPhase != ConnectionPhase.Connected)
                     {
-                        SetPhaseSafe(session, ConnectionPhase.Connected, "Veri Akışı Aktif");
+                        SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
                     }
                 }
                 catch (ModbusProtocolException ex)
                 {
                     if (session.LastProtocolErrorCode == null || session.LastProtocolErrorCode.Value != ex.ExceptionCode)
                     {
-                        LogMessage(session, $"PROTOKOL HATASI (Kod: {ex.ExceptionCode}): {ex.Message}", Color.Red);
+                        LogMessage(session, $"PROTOCOL ERROR (Code: {ex.ExceptionCode}): {ex.Message}", Color.Red);
                         session.LastProtocolErrorCode = ex.ExceptionCode;
                     }
                     ClearGridSafe(session);
 
-                    // KRİTİK DÜZELTME: Soket sağlam (Disconnect çağrılmadı, TryReconnectAsync tetiklenmiyor)
-                    // ama operatöre "yalancı yeşil" göstermek yerine dürüstçe turuncu bir uyarı veriyoruz.
-                    // Aynı "if" koruması burada da geçerli: hata her tekrarında (log throttling zaten var)
-                    // tekrar tekrar aynı fazı set edip gereksiz repaint yapmıyoruz.
+                    // Socket is fine (Disconnect not called, TryReconnectAsync not triggered);
+                    // showing a "false green" to the operator would be misleading, so we show an
+                    // honest orange warning instead. Same "if" guard applies here too.
                     if (session.CurrentPhase != ConnectionPhase.DataError)
                     {
-                        SetPhaseSafe(session, ConnectionPhase.DataError, $"Hatalı İstek (Kod: {ex.ExceptionCode}) — Adres/Adet ayarlarını kontrol edin");
+                        SetPhaseSafe(session, ConnectionPhase.DataError, $"Invalid Request (Code: {ex.ExceptionCode}) — check Address/Quantity settings");
                     }
                 }
                 catch (ModbusTimeoutException ex)
                 {
                     if (token.IsCancellationRequested) break;
 
-                    LogMessage(session, $"ZAMAN AŞIMI: {ex.Message}", Color.Red);
+                    LogMessage(session, $"TIMEOUT: {ex.Message}", Color.Red);
                     ClearGridSafe(session);
 
                     bool reconnected = await TryReconnectAsync(session, token);
-                    if (!reconnected) return;
+                    if (!reconnected) return; // returns control to RunDriverAsync's outer loop
 
                     session.OldValues = null;
                     continue;
@@ -489,7 +528,7 @@ namespace ModbusTester
                 {
                     if (token.IsCancellationRequested) break;
 
-                    LogMessage(session, $"BAĞLANTI HATASI: {ex.Message}", Color.Red);
+                    LogMessage(session, $"CONNECTION ERROR: {ex.Message}", Color.Red);
                     ClearGridSafe(session);
 
                     bool reconnected = await TryReconnectAsync(session, token);
@@ -504,7 +543,7 @@ namespace ModbusTester
 
                     if (session.LastGeneralErrorMessage == null || session.LastGeneralErrorMessage != ex.Message)
                     {
-                        LogMessage(session, $"HATA: {ex.Message}", Color.Red);
+                        LogMessage(session, $"ERROR: {ex.Message}", Color.Red);
                         session.LastGeneralErrorMessage = ex.Message;
                     }
                     ClearGridSafe(session);
@@ -538,24 +577,28 @@ namespace ModbusTester
                 if (token.IsCancellationRequested) return false;
 
                 SetPhaseSafe(session, ConnectionPhase.Reconnecting,
-                    $"Bağlantı koptu, yeniden deneniyor ({attempt}/{ReconnectMaxAttempts})...");
+                    $"Connection lost, reconnecting ({attempt}/{ReconnectMaxAttempts})...");
 
                 try
                 {
                     await Task.Delay(ReconnectDelayMs, token);
                     await session.Client.ConnectAsync();
 
-                    SetPhaseSafe(session, ConnectionPhase.Connected, "Veri Akışı Aktif");
-                    LogMessage(session, "Yeniden bağlantı başarılı.", Color.Green);
+                    SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
+                    LogMessage(session, "Reconnected successfully.", Color.Green);
                     return true;
                 }
                 catch (OperationCanceledException) { return false; }
-                catch (Exception ex) { LogMessage(session, $"Deneme {attempt} başarısız: {ex.Message}", Color.OrangeRed); }
+                catch (Exception ex) { LogMessage(session, $"Attempt {attempt} failed: {ex.Message}", Color.OrangeRed); }
             }
 
-            LogMessage(session, $"{ReconnectMaxAttempts} deneme tükendi, bağlantı fazına geri dönülüyor.", Color.Red);
+            LogMessage(session, $"{ReconnectMaxAttempts} attempts exhausted, returning to connection phase.", Color.Red);
             return false;
         }
+
+        // ---------------------------------------------------------
+        // THREAD-SAFE BATCH UI READ
+        // ---------------------------------------------------------
 
         private PollingParameters GetPollingParametersSafe(TabSession session)
         {
@@ -587,6 +630,10 @@ namespace ModbusTester
             return (session.TxtIp.Text.Trim(), int.TryParse(session.TxtPort.Text.Trim(), out int pp) ? pp : session.CurrentPort);
         }
 
+        // ---------------------------------------------------------
+        // READ + DISPLAY
+        // ---------------------------------------------------------
+
         private async Task ReadAndDisplayAsync(TabSession session, PollingParameters parameters)
         {
             bool isBitBased = parameters.FunctionCode == ModbusFunctionCode.ReadCoils ||
@@ -610,7 +657,7 @@ namespace ModbusTester
                 session.OldBitValues = (bool[])bits.Clone();
                 this.Invoke(new Action(() =>
                 {
-                    LogMessage(session, "Veri Değişti.", Color.Green);
+                    LogMessage(session, "Data changed.", Color.Green);
                     DisplayBitsInGrid(session, bits, parameters.StartAddress);
                 }));
             }
@@ -634,7 +681,7 @@ namespace ModbusTester
                 session.OldValues = (ushort[])destination.Clone();
                 this.Invoke(new Action(() =>
                 {
-                    LogMessage(session, "Veri Değişti.", Color.Green);
+                    LogMessage(session, "Data changed.", Color.Green);
                     DisplayRegistersInGrid(session, destination, parameters.DataType, parameters.StartAddress, registerSizePerItem);
                 }));
             }
@@ -664,6 +711,10 @@ namespace ModbusTester
                 _ => 1
             };
         }
+
+        // ---------------------------------------------------------
+        // GRID (ALLOCATION-FREE, IN-PLACE UPDATES)
+        // ---------------------------------------------------------
 
         private bool IsGridLayoutValid(TabSession session, int expectedRowCount, ushort startAddress, string dataType)
         {
@@ -779,6 +830,10 @@ namespace ModbusTester
             session.RenderedDataType = string.Empty;
         }
 
+        // ---------------------------------------------------------
+        // LOGGING
+        // ---------------------------------------------------------
+
         private void LogMessage(TabSession session, string message, Color color)
         {
             if (session.RtbLogs.InvokeRequired)
@@ -796,6 +851,10 @@ namespace ModbusTester
             session.RtbLogs.SelectionColor = session.RtbLogs.ForeColor;
             session.RtbLogs.ScrollToCaret();
         }
+
+        // ---------------------------------------------------------
+        // WriteForm INTEGRATION
+        // ---------------------------------------------------------
 
         private void DgvRegisters_CellDoubleClick(TabSession session, DataGridViewCellEventArgs e)
         {
@@ -847,6 +906,10 @@ namespace ModbusTester
             }
         }
 
+        // ---------------------------------------------------------
+        // TAB CLOSING
+        // ---------------------------------------------------------
+
         private async void CloseSession(TabSession session)
         {
             await StopDriverAsync(session);
@@ -855,6 +918,10 @@ namespace ModbusTester
             _sessions.Remove(session);
             session.Page.Dispose();
         }
+
+        // ---------------------------------------------------------
+        // TWO-STAGE FORM SHUTDOWN
+        // ---------------------------------------------------------
 
         private async void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
         {
@@ -878,6 +945,10 @@ namespace ModbusTester
             }
         }
 
+        // ---------------------------------------------------------
+        // PARAMETER CARRIER STRUCT
+        // ---------------------------------------------------------
+
         private struct PollingParameters
         {
             public string Ip;
@@ -889,6 +960,10 @@ namespace ModbusTester
             public int UserQuantity;
             public int IntervalMs;
         }
+
+        // ---------------------------------------------------------
+        // TABSESSION
+        // ---------------------------------------------------------
 
         private sealed class TabSession
         {
