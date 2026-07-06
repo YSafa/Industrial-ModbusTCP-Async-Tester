@@ -7,6 +7,7 @@ using ModbusTester.Core;
 using ModbusTester.Core.Core;
 using ModbusTester.Core.Exceptions;
 using ModbusTester.Core.Protocol;
+using System.Threading;
 
 namespace ModbusTester
 {
@@ -33,8 +34,11 @@ namespace ModbusTester
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public Action<string>? OnSuccessLog { get; set; }
 
+        private readonly SemaphoreSlim _transactionLock;
+
         public WriteForm(
             ModbusClient        client,
+            SemaphoreSlim       transactionLock,
             byte                slaveId,
             ushort              address,
             string              dataType,
@@ -42,9 +46,8 @@ namespace ModbusTester
             ushort[]?           currentValues,
             bool[]?             currentBitValues)
         {
-            // Fields must be assigned BEFORE InitializeComponent; pre-fill logic in
-            // BuildDynamicUi depends on these values.
             _client           = client;
+            _transactionLock  = transactionLock;
             _slaveId          = slaveId;
             _address          = address;
             _dataType         = dataType;
@@ -54,11 +57,9 @@ namespace ModbusTester
 
             InitializeComponent();
 
-            // Safe to populate the header text now that fields are assigned.
             lblInfo.Text = $"Address: {_address}    |    Data Type: {_dataType}" +
                            $"\nFunction: {_functionCode}    |    Slave ID: {_slaveId}";
 
-            // Disable writing for read-only function codes.
             if (_functionCode == ModbusFunctionCode.ReadDiscreteInputs ||
                 _functionCode == ModbusFunctionCode.ReadInputRegisters)
             {
@@ -299,19 +300,30 @@ namespace ModbusTester
 
         private async void BtnWrite_Click(object? sender, EventArgs e)
         {
-            btnWrite.Enabled = false; // Prevent double-clicks and overlapping write attempts.
+            btnWrite.Enabled = false;
 
             try
             {
                 bool isBitBased = _functionCode == ModbusFunctionCode.ReadCoils ||
                                   _functionCode == ModbusFunctionCode.ReadDiscreteInputs;
 
-                if (isBitBased)
-                    await WriteCoilAsync();
-                else if (_dataType == "Binary")
-                    await WriteBinaryAsync();
-                else
-                    await WriteValueAsync();
+                // Every manual write funnels through the SAME shared transaction lock used by the
+                // polling loop, guaranteeing this write can never interleave its bytes with a
+                // concurrent read/write from another tab sharing the same physical connection.
+                await _transactionLock.WaitAsync();
+                try
+                {
+                    if (isBitBased)
+                        await WriteCoilAsync();
+                    else if (_dataType == "Binary")
+                        await WriteBinaryAsync();
+                    else
+                        await WriteValueAsync();
+                }
+                finally
+                {
+                    _transactionLock.Release();
+                }
             }
             catch (ModbusProtocolException ex)
             {

@@ -102,29 +102,20 @@ namespace ModbusTester.Core.Core
         // READ FUNCTIONS (FC01 / FC02 / FC03 / FC04)
         // ---------------------------------------------------------
 
-        /// <summary>FC03 - Read Holding Registers.</summary>
-        public Task ReadHoldingRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination)
-            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadHoldingRegisters, slaveId, startAddress, destination);
+        public Task ReadHoldingRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination, int? timeoutMsOverride = null)
+            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadHoldingRegisters, slaveId, startAddress, destination, timeoutMsOverride);
 
-        /// <summary>FC04 - Read Input Registers.</summary>
-        public Task ReadInputRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination)
-            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadInputRegisters, slaveId, startAddress, destination);
+        public Task ReadInputRegistersAsync(byte slaveId, ushort startAddress, ushort[] destination, int? timeoutMsOverride = null)
+            => ReadRegistersInternalAsync(ModbusFunctionCode.ReadInputRegisters, slaveId, startAddress, destination, timeoutMsOverride);
 
-        /// <summary>FC01 - Read Coils.</summary>
-        public Task<bool[]> ReadCoilsAsync(byte slaveId, ushort startAddress, ushort quantity)
-            => ReadBitsInternalAsync(ModbusFunctionCode.ReadCoils, slaveId, startAddress, quantity);
+        public Task<bool[]> ReadCoilsAsync(byte slaveId, ushort startAddress, ushort quantity, int? timeoutMsOverride = null)
+            => ReadBitsInternalAsync(ModbusFunctionCode.ReadCoils, slaveId, startAddress, quantity, timeoutMsOverride);
 
-        /// <summary>FC02 - Read Discrete Inputs.</summary>
-        public Task<bool[]> ReadDiscreteInputsAsync(byte slaveId, ushort startAddress, ushort quantity)
-            => ReadBitsInternalAsync(ModbusFunctionCode.ReadDiscreteInputs, slaveId, startAddress, quantity);
+        public Task<bool[]> ReadDiscreteInputsAsync(byte slaveId, ushort startAddress, ushort quantity, int? timeoutMsOverride = null)
+            => ReadBitsInternalAsync(ModbusFunctionCode.ReadDiscreteInputs, slaveId, startAddress, quantity, timeoutMsOverride);
 
-        /// <summary>
-        /// Shared implementation for FC03/FC04 register reads. Writes results directly into the
-        /// destination buffer supplied by the caller — no per-call array allocation. Automatically
-        /// splits requests exceeding 125 registers into sequential chunks.
-        /// </summary>
         private async Task ReadRegistersInternalAsync(
-            ModbusFunctionCode functionCode, byte slaveId, ushort startAddress, ushort[] destination)
+            ModbusFunctionCode functionCode, byte slaveId, ushort startAddress, ushort[] destination, int? timeoutMsOverride)
         {
             if (destination == null || destination.Length == 0)
                 throw new ArgumentException("Destination buffer cannot be null or empty.", nameof(destination));
@@ -141,11 +132,8 @@ namespace ModbusTester.Core.Core
                 byte[] request = ModbusRequestBuilder.BuildReadRequest(
                     functionCode, transactionId, slaveId, chunkStartAddress, (ushort)chunkSize);
 
-                byte[] response = await SendAndReceiveAsync(request);
+                byte[] response = await SendAndReceiveAsync(request, timeoutMsOverride);
 
-                // response.AsSpan() and destination.AsSpan(...) are produced directly as
-                // arguments to a single synchronous call, without being assigned to a LOCAL
-                // VARIABLE, so they never cross an await boundary and do not trigger CS4012.
                 ModbusResponseParser.ParseReadRegistersResponse(
                     response, destination.AsSpan(destinationOffset, chunkSize), transactionId);
 
@@ -155,12 +143,91 @@ namespace ModbusTester.Core.Core
         }
 
         private async Task<bool[]> ReadBitsInternalAsync(
-            ModbusFunctionCode functionCode, byte slaveId, ushort startAddress, ushort quantity)
+            ModbusFunctionCode functionCode, byte slaveId, ushort startAddress, ushort quantity, int? timeoutMsOverride)
         {
             ushort transactionId = _transactionManager.GetNextTransactionId();
             byte[] request = ModbusRequestBuilder.BuildReadRequest(functionCode, transactionId, slaveId, startAddress, quantity);
-            byte[] response = await SendAndReceiveAsync(request);
+            byte[] response = await SendAndReceiveAsync(request, timeoutMsOverride);
             return ModbusResponseParser.ParseReadBitsResponse(response, transactionId, quantity);
+        }
+
+        internal async Task<byte[]> SendAndReceiveAsync(byte[] requestBuffer, int? timeoutMsOverride = null)
+        {
+            if (!IsConnected || _networkStream == null)
+            {
+                throw new ModbusConnectionException("Cannot send request: no active connection.");
+            }
+
+            await _networkSemaphore.WaitAsync();
+
+            byte[] rentBuffer = ArrayPool<byte>.Shared.Rent(260);
+            int bytesReceivedThisTransaction = 0;
+
+            // Allows callers to request a SHORTER timeout for a specific call (e.g. a quick "probe"
+            // retry against a slave already known to be unreliable), without affecting the
+            // connection's normal IoTimeoutMs used by every other, healthy request sharing this
+            // same pooled socket.
+            int effectiveTimeoutMs = timeoutMsOverride ?? IoTimeoutMs;
+
+            try
+            {
+                using var cts = new CancellationTokenSource(effectiveTimeoutMs);
+
+                await _networkStream!.WriteAsync(requestBuffer, 0, requestBuffer.Length, cts.Token);
+
+                bytesReceivedThisTransaction += await ReadExactAsync(rentBuffer, 0, 6, cts.Token);
+
+                ushort remainingLength = (ushort)((rentBuffer[4] << 8) | rentBuffer[5]);
+
+                if (remainingLength < 2 || remainingLength > 254)
+                {
+                    Disconnect();
+                    throw new ModbusConnectionException(
+                        $"Network protocol violation: invalid packet length detected ({remainingLength} bytes). Connection closed due to lost stream synchronization.");
+                }
+
+                bytesReceivedThisTransaction += await ReadExactAsync(rentBuffer, 6, remainingLength, cts.Token);
+
+                byte[] fullResponse = new byte[6 + remainingLength];
+                Buffer.BlockCopy(rentBuffer, 0, fullResponse, 0, fullResponse.Length);
+
+                return fullResponse;
+            }
+            catch (OperationCanceledException)
+            {
+                if (bytesReceivedThisTransaction > 0)
+                {
+                    Disconnect();
+                    throw new ModbusConnectionException(
+                        $"Timeout after partially receiving {bytesReceivedThisTransaction} byte(s); connection reset to prevent stream desynchronization.");
+                }
+
+                throw new ModbusTimeoutException(
+                    $"No response received within {effectiveTimeoutMs} ms (device/slave may not be responding).");
+            }
+            catch (SocketException socketEx)
+            {
+                Disconnect();
+                throw new ModbusConnectionException($"Network I/O error: {socketEx.Message}", socketEx);
+            }
+            catch (ModbusConnectionException)
+            {
+                throw;
+            }
+            catch (ModbusProtocolException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Disconnect();
+                throw new ModbusConnectionException($"Unexpected send/receive error: {ex.Message}", ex);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rentBuffer);
+                _networkSemaphore.Release();
+            }
         }
 
         // ---------------------------------------------------------
@@ -188,7 +255,8 @@ namespace ModbusTester.Core.Core
         public async Task WriteSingleRegisterAsync(byte slaveId, ushort address, ushort value)
         {
             ushort transactionId = _transactionManager.GetNextTransactionId();
-            byte[] request = ModbusRequestBuilder.BuildWriteSingleRegisterRequest(transactionId, slaveId, address, value);
+            byte[] request =
+                ModbusRequestBuilder.BuildWriteSingleRegisterRequest(transactionId, slaveId, address, value);
             byte[] response = await SendAndReceiveAsync(request);
 
             ModbusResponseParser.ValidateWriteSingleResponse(
@@ -207,7 +275,8 @@ namespace ModbusTester.Core.Core
             }
 
             ushort transactionId = _transactionManager.GetNextTransactionId();
-            byte[] request = ModbusRequestBuilder.BuildWriteMultipleRegistersRequest(transactionId, slaveId, startAddress, values);
+            byte[] request =
+                ModbusRequestBuilder.BuildWriteMultipleRegistersRequest(transactionId, slaveId, startAddress, values);
             byte[] response = await SendAndReceiveAsync(request);
 
             ModbusResponseParser.ValidateWriteMultipleRegistersResponse(
@@ -225,13 +294,16 @@ namespace ModbusTester.Core.Core
                 throw new ModbusConnectionException("Cannot send request: no active connection.");
             }
 
-            // Semaphore: guarantees only one transaction can use the socket at a time.
             await _networkSemaphore.WaitAsync();
 
-            // Rented from the pool to cover the maximum Modbus TCP ADU size
-            // (MBAP header 6 + Unit ID 1 + PDU max 253 = 260 bytes); avoids a new array
-            // allocation on every transaction.
             byte[] rentBuffer = ArrayPool<byte>.Shared.Rent(260);
+
+            // Tracks how many bytes were actually received in THIS transaction, across both the
+            // header and body reads. Used to distinguish a clean "slave didn't respond at all"
+            // timeout (safe — stream alignment intact, socket stays open for other multiplexed
+            // tabs) from a "response started arriving but never completed" timeout (dangerous —
+            // stream is desynced, the shared socket must be torn down).
+            int bytesReceivedThisTransaction = 0;
 
             try
             {
@@ -239,32 +311,18 @@ namespace ModbusTester.Core.Core
 
                 await _networkStream!.WriteAsync(requestBuffer, 0, requestBuffer.Length, cts.Token);
 
-                // The first 6 bytes of the MBAP header are read directly into the start of the rented buffer.
-                await ReadExactAsync(rentBuffer, 0, 6, cts.Token);
+                bytesReceivedThisTransaction += await ReadExactAsync(rentBuffer, 0, 6, cts.Token);
 
-                // Length field is Big-Endian: MSB first, LSB second.
                 ushort remainingLength = (ushort)((rentBuffer[4] << 8) | rentBuffer[5]);
 
-                // Guard Clause: validated before continuing with socket I/O. Otherwise, a
-                // corrupted/noisy packet could attempt to exceed the bounds of the rented
-                // 260-byte buffer and throw an ArgumentOutOfRangeException. Instead, we detect
-                // this here and reset the socket cleanly — trying to guess how many bytes to
-                // discard from the stream based on a corrupted length field is unsafe; the only
-                // reliable option once stream alignment is lost is to close and reconnect.
                 if (remainingLength < 2 || remainingLength > 254)
                 {
                     Disconnect();
-
-                    // Deliberately a ModbusConnectionException, not a ModbusProtocolException:
-                    // this is not a legitimate device-level protocol error but evidence that we
-                    // could no longer reliably read the stream — a transport integrity issue.
-                    // This lets upstream layers (WinForms/Console) trigger reconnect logic
-                    // immediately, in the same tick, instead of one cycle later.
                     throw new ModbusConnectionException(
                         $"Network protocol violation: invalid packet length detected ({remainingLength} bytes). Connection closed due to lost stream synchronization.");
                 }
 
-                await ReadExactAsync(rentBuffer, 6, remainingLength, cts.Token);
+                bytesReceivedThisTransaction += await ReadExactAsync(rentBuffer, 6, remainingLength, cts.Token);
 
                 byte[] fullResponse = new byte[6 + remainingLength];
                 Buffer.BlockCopy(rentBuffer, 0, fullResponse, 0, fullResponse.Length);
@@ -273,9 +331,22 @@ namespace ModbusTester.Core.Core
             }
             catch (OperationCanceledException)
             {
-                Disconnect();
+                if (bytesReceivedThisTransaction > 0)
+                {
+                    // Partial data was received before the timeout hit — the stream is now
+                    // misaligned for the next transaction. This is a genuine transport integrity
+                    // failure, not just a quiet slave; the shared socket must be reset.
+                    Disconnect();
+                    throw new ModbusConnectionException(
+                        $"Timeout after partially receiving {bytesReceivedThisTransaction} byte(s); connection reset to prevent stream desynchronization.");
+                }
+
+                // Zero bytes were received: nothing was consumed from the stream, so it remains
+                // perfectly aligned. This is a clean "this device/slave didn't answer in time"
+                // timeout — critical to NOT disconnect here, since in a multiplexed pool this
+                // same socket may be serving other, perfectly healthy slave IDs.
                 throw new ModbusTimeoutException(
-                    $"Send/receive operation did not complete within {IoTimeoutMs} ms.");
+                    $"No response received within {IoTimeoutMs} ms (device/slave may not be responding).");
             }
             catch (SocketException socketEx)
             {
@@ -284,14 +355,10 @@ namespace ModbusTester.Core.Core
             }
             catch (ModbusConnectionException)
             {
-                // Re-thrown as-is from the guard clause above (Disconnect already called);
-                // no need to wrap it again.
                 throw;
             }
             catch (ModbusProtocolException)
             {
-                // Reserved for legitimate device-level Modbus exception responses (0x01-0x0B);
-                // the connection stays alive, so it is passed up unchanged without disconnecting.
                 throw;
             }
             catch (Exception ex)
@@ -301,19 +368,19 @@ namespace ModbusTester.Core.Core
             }
             finally
             {
-                // The rented buffer is always returned to the pool, success or failure.
                 ArrayPool<byte>.Shared.Return(rentBuffer);
                 _networkSemaphore.Release();
             }
         }
 
         /// <summary>
-        /// Reads exactly the requested number of bytes from the NetworkStream into the caller's
-        /// buffer, starting at the given offset. TCP may deliver data in fragments, so a single
-        /// ReadAsync call may not be sufficient; this loop continues until the requested amount
-        /// has been read in full.
+        /// Reads exactly the requested number of bytes into the caller's buffer. Returns the number
+        /// of bytes successfully read before either completing or being cancelled — this lets the
+        /// caller distinguish "timed out with zero bytes received" (stream still aligned, safe) from
+        /// "timed out mid-read" (stream desynced, socket must be reset), without using a ref/out
+        /// parameter, which async methods cannot have (CS1988).
         /// </summary>
-        private async Task ReadExactAsync(byte[] buffer, int offset, int byteCount, CancellationToken token)
+        private async Task<int> ReadExactAsync(byte[] buffer, int offset, int byteCount, CancellationToken token)
         {
             int totalRead = 0;
 
@@ -328,6 +395,8 @@ namespace ModbusTester.Core.Core
 
                 totalRead += read;
             }
+
+            return totalRead;
         }
     }
 }

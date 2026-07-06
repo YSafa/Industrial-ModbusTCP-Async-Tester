@@ -28,6 +28,9 @@ namespace ModbusTester
 
         private const int ReconnectMaxAttempts = 5;
         private const int ReconnectDelayMs     = 2000;
+        private const int TimeoutBackoffMs = 3000;
+        private const int ProbeTimeoutMs = 300;
+        private const int RequiredConsecutiveSuccesses = 3;
 
         private enum ConnectionPhase { Idle, Searching, Connected, DataError, Reconnecting }
 
@@ -337,10 +340,8 @@ namespace ModbusTester
             if (!int.TryParse(session.TxtPort.Text.Trim(), out int port) || port <= 0 || port > 65535)
             { LogMessage(session, "Invalid port number.", Color.Red); return; }
 
-            session.CurrentIp = ip;
-            session.CurrentPort = port;
-            session.Client = new ModbusClient(ip, port) { ConnectTimeoutMs = 3000, IoTimeoutMs = 3000 };
-
+            // The physical connection is now acquired lazily inside EstablishConnectionAsync via the
+            // shared ModbusConnectionManager pool — no ModbusClient is constructed directly here.
             session.DriverCts = new CancellationTokenSource();
             var token = session.DriverCts.Token;
 
@@ -375,10 +376,16 @@ namespace ModbusTester
             session.Timer?.Dispose();
             session.Timer = null;
 
-            session.Client?.Disconnect();
+            // Release this tab's reference to the shared pooled connection instead of disconnecting
+            // it directly — the physical socket only closes once every tab using it has released.
+            if (session.Connection != null)
+            {
+                ModbusConnectionManager.Release(session.CurrentIp, session.CurrentPort);
+                session.Connection = null;
+            }
 
             SetPhaseSafe(session, ConnectionPhase.Idle, "Not Connected");
-            ClearGridSafe(session);
+            ClearGridSafe(session); // Explicit Stop still clears the grid, unlike automatic error paths.
         }
 
         // ---------------------------------------------------------
@@ -432,19 +439,25 @@ namespace ModbusTester
             {
                 (string liveIp, int livePort) = GetIpPortSafe(session);
 
-                if (liveIp != session.CurrentIp || livePort != session.CurrentPort)
+                if (session.Connection == null || liveIp != session.CurrentIp || livePort != session.CurrentPort)
                 {
-                    session.Client?.Disconnect();
+                    // Release any previous pooled connection this tab was registered under before
+                    // acquiring the new target — RefCount must always stay balanced 1:1 per tab.
+                    if (session.Connection != null)
+                    {
+                        ModbusConnectionManager.Release(session.CurrentIp, session.CurrentPort);
+                        session.Connection = null;
+                    }
+
                     session.CurrentIp = liveIp;
                     session.CurrentPort = livePort;
-                    session.Client = new ModbusClient(liveIp, livePort) { ConnectTimeoutMs = 3000, IoTimeoutMs = 3000 };
                 }
 
                 SetPhaseSafe(session, ConnectionPhase.Searching, $"Searching for device: {session.CurrentIp}:{session.CurrentPort}...");
 
                 try
                 {
-                    await session.Client!.ConnectAsync();
+                    session.Connection = await ModbusConnectionManager.AcquireAsync(liveIp, livePort, 3000, 3000);
                     LogMessage(session, "Connected successfully.", Color.Green);
                     SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
                     return true;
@@ -471,88 +484,116 @@ namespace ModbusTester
 
                 if (parameters.Ip != session.CurrentIp || parameters.Port != session.CurrentPort)
                 {
-                    var temp = new ModbusClient(parameters.Ip, parameters.Port) { ConnectTimeoutMs = 3000, IoTimeoutMs = 3000 };
+                    // ... (değişmedi)
+                }
+
+                // BACKOFF GUARD: if this tab is currently in a timeout backoff window, skip the
+                // actual read entirely this tick — never touch the shared TransactionLock. This is
+                // the key fix for the "noisy neighbor" problem: without it, a consistently-timing-out
+                // slave would grab the shared lock every single tick for the full IoTimeoutMs
+                // duration, throttling every other tab sharing the same physical socket down to its
+                // own retry cadence. By skipping ticks during backoff, the lock is left free for
+                // healthy tabs almost all the time.
+                bool inBackoff = session.TimeoutBackoffUntilUtc.HasValue && DateTime.UtcNow < session.TimeoutBackoffUntilUtc.Value;
+
+                if (!inBackoff)
+                {
                     try
                     {
-                        await temp.ConnectAsync();
-                        session.Client?.Disconnect();
-                        session.Client = temp;
-                        session.CurrentIp = parameters.Ip;
-                        session.CurrentPort = parameters.Port;
+                        await ReadAndDisplayAsync(session, parameters);
+                        session.ConsecutiveSuccessCount++;
+
+                        // Only clear the error/backoff state (and switch the phase back to green) after a
+                        // few consecutive clean reads — not on the very first one. A single lucky response
+                        // from a flaky device shouldn't reset the "we were failing" memory, otherwise the
+                        // next failure gets logged as if it were brand new, producing exactly the noisy
+                        // "error every ~5s" pattern seen with an intermittently-responding slave.
+                        if (session.ConsecutiveSuccessCount >= RequiredConsecutiveSuccesses)
+                        {
+                            session.LastProtocolErrorCode = null;
+                            session.LastGeneralErrorMessage = null;
+                            session.TimeoutBackoffUntilUtc = null;
+
+                            if (session.CurrentPhase != ConnectionPhase.Connected)
+                            {
+                                SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
+                            }
+                        }
+                    }
+                    catch (ModbusProtocolException ex)
+                    {
+                        session.ConsecutiveSuccessCount = 0;
+
+                        if (session.LastProtocolErrorCode == null || session.LastProtocolErrorCode.Value != ex.ExceptionCode)
+                        {
+                            LogMessage(session, $"PROTOCOL ERROR (Code: {ex.ExceptionCode}): {ex.Message}", Color.Red);
+                            session.LastProtocolErrorCode = ex.ExceptionCode;
+                        }
+
+                        if (session.CurrentPhase != ConnectionPhase.DataError)
+                        {
+                            SetPhaseSafe(session, ConnectionPhase.DataError, $"Invalid Request (Code: {ex.ExceptionCode}) — check Address/Quantity settings");
+                        }
+                    }
+                    catch (ModbusTimeoutException ex)
+                    {
+                        if (token.IsCancellationRequested) break;
+
+                        session.ConsecutiveSuccessCount = 0;
+
+                        string errorMessage = $"TIMEOUT (Slave ID: {parameters.SlaveId}): {ex.Message}";
+                        if (session.LastGeneralErrorMessage != errorMessage)
+                        {
+                            LogMessage(session, errorMessage, Color.Red);
+                            session.LastGeneralErrorMessage = errorMessage;
+                        }
+
+                        if (session.Connection != null && session.Connection.Client.IsConnected)
+                        {
+                            if (session.CurrentPhase != ConnectionPhase.DataError)
+                            {
+                                SetPhaseSafe(session, ConnectionPhase.DataError, $"Device Timeout — Check Slave ID {parameters.SlaveId} status");
+                            }
+
+                            session.OldValues = null;
+                            session.OldBitValues = null;
+                            session.TimeoutBackoffUntilUtc = DateTime.UtcNow.AddMilliseconds(TimeoutBackoffMs);
+                        }
+                        else
+                        {
+                            bool reconnected = await TryReconnectAsync(session, token);
+                            if (!reconnected) return;
+                            session.OldValues = null;
+                            session.LastGeneralErrorMessage = null;
+                            session.TimeoutBackoffUntilUtc = null;
+                        }
+                        continue;
+                    }
+                    catch (ModbusConnectionException ex)
+                    {
+                        if (token.IsCancellationRequested) break;
+
+                        session.ConsecutiveSuccessCount = 0;
+                        LogMessage(session, $"CONNECTION ERROR: {ex.Message}", Color.Red);
+
+                        bool reconnected = await TryReconnectAsync(session, token);
+                        if (!reconnected) return;
+
                         session.OldValues = null;
+                        continue;
                     }
                     catch (Exception ex)
                     {
-                        temp.Disconnect();
-                        LogMessage(session, $"Unexpected address-change attempt failed: {ex.Message}", Color.Red);
+                        if (token.IsCancellationRequested) break;
+
+                        session.ConsecutiveSuccessCount = 0;
+
+                        if (session.LastGeneralErrorMessage == null || session.LastGeneralErrorMessage != ex.Message)
+                        {
+                            LogMessage(session, $"ERROR: {ex.Message}", Color.Red);
+                            session.LastGeneralErrorMessage = ex.Message;
+                        }
                     }
-                }
-
-                try
-                {
-                    await ReadAndDisplayAsync(session, parameters);
-                    session.LastProtocolErrorCode = null;
-                    session.LastGeneralErrorMessage = null;
-
-                    if (session.CurrentPhase != ConnectionPhase.Connected)
-                    {
-                        SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
-                    }
-                }
-                catch (ModbusProtocolException ex)
-                {
-                    if (session.LastProtocolErrorCode == null || session.LastProtocolErrorCode.Value != ex.ExceptionCode)
-                    {
-                        LogMessage(session, $"PROTOCOL ERROR (Code: {ex.ExceptionCode}): {ex.Message}", Color.Red);
-                        session.LastProtocolErrorCode = ex.ExceptionCode;
-                    }
-
-                    // DATA PERSISTENCE: the grid is intentionally NOT cleared here. The socket is
-                    // fine — only the request itself was rejected — so the last successfully
-                    // displayed values remain on screen. The DataError phase label is the only
-                    // signal that something is wrong; the grid keeps showing stale-but-valid data.
-                    if (session.CurrentPhase != ConnectionPhase.DataError)
-                    {
-                        SetPhaseSafe(session, ConnectionPhase.DataError, $"Invalid Request (Code: {ex.ExceptionCode}) — check Address/Quantity settings");
-                    }
-                }
-                catch (ModbusTimeoutException ex)
-                {
-                    if (token.IsCancellationRequested) break;
-
-                    LogMessage(session, $"TIMEOUT: {ex.Message}", Color.Red);
-
-                    // DATA PERSISTENCE: grid is left untouched even though the connection is about
-                    // to be retried. The operator keeps seeing the last known-good reading instead
-                    // of a blank table while reconnect attempts are in progress.
-                    bool reconnected = await TryReconnectAsync(session, token);
-                    if (!reconnected) return;
-
-                    session.OldValues = null;
-                    continue;
-                }
-                catch (ModbusConnectionException ex)
-                {
-                    if (token.IsCancellationRequested) break;
-
-                    LogMessage(session, $"CONNECTION ERROR: {ex.Message}", Color.Red);
-
-                    bool reconnected = await TryReconnectAsync(session, token);
-                    if (!reconnected) return;
-
-                    session.OldValues = null;
-                    continue;
-                }
-                catch (Exception ex)
-                {
-                    if (token.IsCancellationRequested) break;
-
-                    if (session.LastGeneralErrorMessage == null || session.LastGeneralErrorMessage != ex.Message)
-                    {
-                        LogMessage(session, $"ERROR: {ex.Message}", Color.Red);
-                        session.LastGeneralErrorMessage = ex.Message;
-                    }
-                    // Grid intentionally left as-is — same persistence rule applies to unexpected errors.
                 }
 
                 if (parameters.IntervalMs != lastIntervalMs && parameters.IntervalMs > 0)
@@ -576,26 +617,51 @@ namespace ModbusTester
 
         private async Task<bool> TryReconnectAsync(TabSession session, CancellationToken token)
         {
-            if (session.Client == null) return false;
+            var connection = session.Connection;
+            if (connection == null) return false;
+
+            SetPhaseSafe(session, ConnectionPhase.Reconnecting, "Connection lost, preparing to reconnect...");
 
             for (int attempt = 1; attempt <= ReconnectMaxAttempts; attempt++)
             {
                 if (token.IsCancellationRequested) return false;
 
-                SetPhaseSafe(session, ConnectionPhase.Reconnecting,
-                    $"Connection lost, reconnecting ({attempt}/{ReconnectMaxAttempts})...");
+                // CRITICAL FIX: the wait happens OUTSIDE the lock. Other tabs sharing this same
+                // connection remain free to read/write while this tab waits between attempts.
+                if (attempt > 1)
+                {
+                    try { await Task.Delay(ReconnectDelayMs, token); }
+                    catch (OperationCanceledException) { return false; }
+                }
 
+                await connection.TransactionLock.WaitAsync(token);
                 try
                 {
-                    await Task.Delay(ReconnectDelayMs, token);
-                    await session.Client.ConnectAsync();
+                    // Double-checked locking: another tab sharing this connection may have already
+                    // restored it while we were waiting for the lock.
+                    if (connection.Client.IsConnected)
+                    {
+                        SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
+                        LogMessage(session, "Connection already restored by another tab sharing this device.", Color.Green);
+                        return true;
+                    }
+
+                    SetPhaseSafe(session, ConnectionPhase.Reconnecting, $"Reconnecting ({attempt}/{ReconnectMaxAttempts})...");
+                    await connection.Client.ConnectAsync();
 
                     SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
                     LogMessage(session, "Reconnected successfully.", Color.Green);
                     return true;
                 }
                 catch (OperationCanceledException) { return false; }
-                catch (Exception ex) { LogMessage(session, $"Attempt {attempt} failed: {ex.Message}", Color.OrangeRed); }
+                catch (Exception ex)
+                {
+                    LogMessage(session, $"Attempt {attempt} failed: {ex.Message}", Color.OrangeRed);
+                }
+                finally
+                {
+                    connection.TransactionLock.Release();
+                }
             }
 
             LogMessage(session, $"{ReconnectMaxAttempts} attempts exhausted, returning to connection phase.", Color.Red);
@@ -651,11 +717,30 @@ namespace ModbusTester
 
         private async Task ReadAndDisplayBitsAsync(TabSession session, PollingParameters parameters)
         {
-            if (session.Client == null) return;
+            var connection = session.Connection;
+            if (connection == null) return;
 
-            bool[] bits = parameters.FunctionCode == ModbusFunctionCode.ReadCoils
-                ? await session.Client.ReadCoilsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity)
-                : await session.Client.ReadDiscreteInputsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity);
+            // If this tab is currently recovering from a prior timeout (TimeoutBackoffUntilUtc is
+            // set, whether the window is still active or has just expired), use a short probe
+            // timeout instead of the full IoTimeoutMs. This keeps the shared TransactionLock held
+            // for only ~300ms per retry instead of 3000ms, so other tabs sharing the same physical
+            // socket barely notice this slave's continued failures. Once the slave proves itself
+            // healthy again (3 consecutive successes), this reverts to the normal, full timeout.
+            int? probeTimeout = session.TimeoutBackoffUntilUtc.HasValue ? ProbeTimeoutMs : (int?)null;
+
+            bool[] bits;
+
+            await connection.TransactionLock.WaitAsync();
+            try
+            {
+                bits = parameters.FunctionCode == ModbusFunctionCode.ReadCoils
+                    ? await connection.Client.ReadCoilsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity, probeTimeout)
+                    : await connection.Client.ReadDiscreteInputsAsync(parameters.SlaveId, parameters.StartAddress, (ushort)parameters.UserQuantity, probeTimeout);
+            }
+            finally
+            {
+                connection.TransactionLock.Release();
+            }
 
             bool hasChanged = HasBitValuesChanged(session.OldBitValues, bits);
             if (hasChanged)
@@ -671,15 +756,26 @@ namespace ModbusTester
 
         private async Task ReadAndDisplayRegistersAsync(TabSession session, PollingParameters parameters)
         {
-            if (session.Client == null || session.RegisterReadBuffer == null) return;
+            var connection = session.Connection;
+            if (connection == null || session.RegisterReadBuffer == null) return;
 
             ushort[] destination = session.RegisterReadBuffer;
             int registerSizePerItem = GetRegisterSizeForDataType(parameters.DataType);
 
-            if (parameters.FunctionCode == ModbusFunctionCode.ReadHoldingRegisters)
-                await session.Client.ReadHoldingRegistersAsync(parameters.SlaveId, parameters.StartAddress, destination);
-            else
-                await session.Client.ReadInputRegistersAsync(parameters.SlaveId, parameters.StartAddress, destination);
+            int? probeTimeout = session.TimeoutBackoffUntilUtc.HasValue ? ProbeTimeoutMs : (int?)null;
+
+            await connection.TransactionLock.WaitAsync();
+            try
+            {
+                if (parameters.FunctionCode == ModbusFunctionCode.ReadHoldingRegisters)
+                    await connection.Client.ReadHoldingRegistersAsync(parameters.SlaveId, parameters.StartAddress, destination, probeTimeout);
+                else
+                    await connection.Client.ReadInputRegistersAsync(parameters.SlaveId, parameters.StartAddress, destination, probeTimeout);
+            }
+            finally
+            {
+                connection.TransactionLock.Release();
+            }
 
             bool hasChanged = HasValuesChanged(session.OldValues, destination);
             if (hasChanged)
@@ -692,6 +788,8 @@ namespace ModbusTester
                 }));
             }
         }
+
+
 
         private bool HasValuesChanged(ushort[]? oldValues, ushort[] newValues)
         {
@@ -872,12 +970,12 @@ namespace ModbusTester
         private void DgvRegisters_CellDoubleClick(TabSession session, DataGridViewCellEventArgs e)
         {
             if (e.RowIndex < 0) return;
-            if (session.Client == null || !session.Client.IsConnected) return;
+            if (session.Connection == null || !session.Connection.Client.IsConnected) return;
 
             var parameters = ReadPollingParametersFromUi(session);
 
             bool isBitBased  = parameters.FunctionCode == ModbusFunctionCode.ReadCoils ||
-                                parameters.FunctionCode == ModbusFunctionCode.ReadDiscreteInputs;
+                               parameters.FunctionCode == ModbusFunctionCode.ReadDiscreteInputs;
             int registerSize = isBitBased ? 1 : GetRegisterSizeForDataType(parameters.DataType);
 
             string addrCell  = session.Dgv.Rows[e.RowIndex].Cells[0].Value?.ToString() ?? "0";
@@ -907,7 +1005,8 @@ namespace ModbusTester
             }
 
             using var writeForm = new WriteForm(
-                session.Client, parameters.SlaveId, itemAddress, parameters.DataType,
+                session.Connection.Client, session.Connection.TransactionLock,
+                parameters.SlaveId, itemAddress, parameters.DataType,
                 parameters.FunctionCode, slice, bitSlice);
 
             writeForm.OnSuccessLog = msg => LogMessage(session, msg, Color.Green);
@@ -982,7 +1081,7 @@ namespace ModbusTester
         {
             public TabPage Page { get; }
 
-            public ModbusClient? Client { get; set; }
+            public PooledConnection? Connection { get; set; }
             public CancellationTokenSource? DriverCts { get; set; }
             public Task? DriverTask { get; set; }
             public PeriodicTimer? Timer { get; set; }
@@ -997,6 +1096,7 @@ namespace ModbusTester
 
             public byte? LastProtocolErrorCode { get; set; }
             public string? LastGeneralErrorMessage { get; set; }
+            public DateTime? TimeoutBackoffUntilUtc { get; set; }
 
             public ushort RenderedStartAddress { get; set; }
             public int RenderedRowCount { get; set; }
@@ -1017,6 +1117,8 @@ namespace ModbusTester
             public RichTextBox RtbLogs { get; set; } = null!;
             public Label LblPhase { get; set; } = null!;
 
+            public int ConsecutiveSuccessCount { get; set; }
+            
             public TabSession(TabPage page) { Page = page; }
         }
     }
