@@ -57,6 +57,16 @@ namespace ModbusTester
         private void CreateAndAddSession(string tabName, bool closable)
         {
             TabSession session = BuildSession(tabName, closable);
+
+            // If any existing tab already has an active connection, pre-fill the new tab's
+            // IP/Port with the same values — most multi-slave setups target the same gateway/PLC.
+            var activeSession = _sessions.Find(s => s.Connection != null && s.Connection.Client.IsConnected);
+            if (activeSession != null)
+            {
+                session.TxtIp.Text = activeSession.CurrentIp;
+                session.TxtPort.Text = activeSession.CurrentPort.ToString();
+            }
+
             _sessions.Add(session);
             tabControl.TabPages.Add(session.Page);
             tabControl.SelectedTab = session.Page;
