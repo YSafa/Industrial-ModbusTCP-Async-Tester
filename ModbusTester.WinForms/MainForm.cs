@@ -392,15 +392,17 @@ namespace ModbusTester
                 bool connected = await EstablishConnectionAsync(session, token);
                 if (!connected) break;
 
-                // Connection is now proven; structural parameters are locked in the Connected
-                // phase, so we read them ONCE and allocate the register buffer once as well.
                 PollingParameters initialParams = GetPollingParametersSafe(session);
                 bool isBitBased = initialParams.FunctionCode == ModbusFunctionCode.ReadCoils ||
-                                   initialParams.FunctionCode == ModbusFunctionCode.ReadDiscreteInputs;
+                                  initialParams.FunctionCode == ModbusFunctionCode.ReadDiscreteInputs;
 
+                // REGISTER-CENTRIC: Quantity now means "raw 16-bit registers to read from the wire",
+                // matching ModScan/Modbus Poll conventions. No multiplication by registerSizePerItem —
+                // if the user enters 10 and selects Long (32-bit), 10 registers are read and 5 rows
+                // (Long values) are displayed, not 20 registers.
                 session.RegisterReadBuffer = isBitBased
                     ? null
-                    : new ushort[initialParams.UserQuantity * GetRegisterSizeForDataType(initialParams.DataType)];
+                    : new ushort[initialParams.UserQuantity];
 
                 session.OldValues = null;
                 session.OldBitValues = null;
@@ -419,8 +421,6 @@ namespace ModbusTester
                     timer.Dispose();
                     session.Timer = null;
                 }
-                // If the inner loop broke (reconnect exhausted), the outer loop restarts and
-                // returns to EstablishConnectionAsync automatically.
             }
 
             SetPhaseSafe(session, ConnectionPhase.Idle, "Not Connected");
@@ -469,9 +469,6 @@ namespace ModbusTester
             {
                 PollingParameters parameters = GetPollingParametersSafe(session);
 
-                // NOTE: This block never actually fires in practice while Connected, since
-                // TxtIp/TxtPort are disabled in that phase and the user cannot change them.
-                // Left in place as a defensive fallback in case locking rules are relaxed later.
                 if (parameters.Ip != session.CurrentIp || parameters.Port != session.CurrentPort)
                 {
                     var temp = new ModbusClient(parameters.Ip, parameters.Port) { ConnectTimeoutMs = 3000, IoTimeoutMs = 3000 };
@@ -497,10 +494,6 @@ namespace ModbusTester
                     session.LastProtocolErrorCode = null;
                     session.LastGeneralErrorMessage = null;
 
-                    // Last read succeeded; if the phase is NOT already Connected (i.e. we were
-                    // in DataError on the previous tick), switch back to green automatically.
-                    // The "if" guard is deliberate: on every successful tick (every 200ms) we
-                    // avoid a redundant Invoke/label repaint, only firing on an actual state change.
                     if (session.CurrentPhase != ConnectionPhase.Connected)
                     {
                         SetPhaseSafe(session, ConnectionPhase.Connected, "Data Stream Active");
@@ -513,11 +506,11 @@ namespace ModbusTester
                         LogMessage(session, $"PROTOCOL ERROR (Code: {ex.ExceptionCode}): {ex.Message}", Color.Red);
                         session.LastProtocolErrorCode = ex.ExceptionCode;
                     }
-                    ClearGridSafe(session);
 
-                    // Socket is fine (Disconnect not called, TryReconnectAsync not triggered);
-                    // showing a "false green" to the operator would be misleading, so we show an
-                    // honest orange warning instead. Same "if" guard applies here too.
+                    // DATA PERSISTENCE: the grid is intentionally NOT cleared here. The socket is
+                    // fine — only the request itself was rejected — so the last successfully
+                    // displayed values remain on screen. The DataError phase label is the only
+                    // signal that something is wrong; the grid keeps showing stale-but-valid data.
                     if (session.CurrentPhase != ConnectionPhase.DataError)
                     {
                         SetPhaseSafe(session, ConnectionPhase.DataError, $"Invalid Request (Code: {ex.ExceptionCode}) — check Address/Quantity settings");
@@ -528,10 +521,12 @@ namespace ModbusTester
                     if (token.IsCancellationRequested) break;
 
                     LogMessage(session, $"TIMEOUT: {ex.Message}", Color.Red);
-                    ClearGridSafe(session);
 
+                    // DATA PERSISTENCE: grid is left untouched even though the connection is about
+                    // to be retried. The operator keeps seeing the last known-good reading instead
+                    // of a blank table while reconnect attempts are in progress.
                     bool reconnected = await TryReconnectAsync(session, token);
-                    if (!reconnected) return; // returns control to RunDriverAsync's outer loop
+                    if (!reconnected) return;
 
                     session.OldValues = null;
                     continue;
@@ -541,7 +536,6 @@ namespace ModbusTester
                     if (token.IsCancellationRequested) break;
 
                     LogMessage(session, $"CONNECTION ERROR: {ex.Message}", Color.Red);
-                    ClearGridSafe(session);
 
                     bool reconnected = await TryReconnectAsync(session, token);
                     if (!reconnected) return;
@@ -558,7 +552,7 @@ namespace ModbusTester
                         LogMessage(session, $"ERROR: {ex.Message}", Color.Red);
                         session.LastGeneralErrorMessage = ex.Message;
                     }
-                    ClearGridSafe(session);
+                    // Grid intentionally left as-is — same persistence rule applies to unexpected errors.
                 }
 
                 if (parameters.IntervalMs != lastIntervalMs && parameters.IntervalMs > 0)
@@ -800,13 +794,20 @@ namespace ModbusTester
 
         private void DisplayRegistersInGrid(TabSession session, ushort[] registers, string dataType, ushort startAddress, int registerSizePerItem)
         {
+            // Row count is derived by integer division; if Quantity isn't an exact multiple of
+            // registerSizePerItem (e.g. 5 registers with Long=2), the remainder register is
+            // silently dropped from the grid — it doesn't form a complete value.
             int expectedRowCount = registers.Length / registerSizePerItem;
             bool layoutValid = IsGridLayoutValid(session, expectedRowCount, startAddress, dataType);
 
             if (!layoutValid)
             {
                 session.Dgv.Rows.Clear();
-                for (int i = 0; i < registers.Length; i += registerSizePerItem)
+
+                // Tail guard: stop before the last group if it doesn't have enough registers
+                // remaining to form a full value (only relevant when Quantity isn't a clean
+                // multiple of registerSizePerItem).
+                for (int i = 0; i + registerSizePerItem <= registers.Length; i += registerSizePerItem)
                 {
                     ushort itemAddress = (ushort)(startAddress + i);
                     string addressLabel = GetRegisterAddressLabel(itemAddress, registerSizePerItem);
@@ -821,7 +822,7 @@ namespace ModbusTester
             else
             {
                 int rowIndex = 0;
-                for (int i = 0; i < registers.Length; i += registerSizePerItem)
+                for (int i = 0; i + registerSizePerItem <= registers.Length; i += registerSizePerItem)
                 {
                     object value = GetRegisterDisplayValue(registers, dataType, i, registerSizePerItem);
                     session.Dgv.Rows[rowIndex].Cells[1].Value = value;
