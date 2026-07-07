@@ -45,41 +45,53 @@ namespace ModbusTester.Core.Core
 
         public async Task ConnectAsync()
         {
+            // Clean up any stale/dead client left over from a previous connection or a failed
+            // attempt, so a reconnect never leaks the old socket.
+            Disconnect();
+
+            // The new client is kept in a local until the connection is PROVEN successful;
+            // _tcpClient/_networkStream are only assigned at the very end. This guarantees
+            // IsConnected never reports true (and no half-open socket is ever left in the
+            // fields) when this method throws.
+            var tcpClient = new TcpClient();
+
             try
             {
-                _tcpClient = new TcpClient();
-
                 using var cts = new CancellationTokenSource(ConnectTimeoutMs);
-                var connectTask = _tcpClient.ConnectAsync(_ipAddress, _port);
-                var timeoutTask = Task.Delay(Timeout.Infinite, cts.Token);
 
-                var completedTask = await Task.WhenAny(connectTask, timeoutTask);
+                // .NET 5+ ConnectAsync natively supports cancellation — no Task.WhenAny /
+                // Task.Delay race is needed, and no abandoned connect task is left behind
+                // on timeout.
+                await tcpClient.ConnectAsync(_ipAddress, _port, cts.Token);
 
-                if (completedTask != connectTask)
-                {
-                    throw new ModbusTimeoutException(
-                        $"Timed out connecting to '{_ipAddress}:{_port}' ({ConnectTimeoutMs} ms).");
-                }
-
-                await connectTask;
-
-                _networkStream = _tcpClient.GetStream();
+                _networkStream = tcpClient.GetStream();
+                _tcpClient = tcpClient;
+            }
+            catch (OperationCanceledException)
+            {
+                tcpClient.Dispose();
+                throw new ModbusTimeoutException(
+                    $"Timed out connecting to '{_ipAddress}:{_port}' ({ConnectTimeoutMs} ms).");
             }
             catch (SocketException socketEx)
             {
+                tcpClient.Dispose();
                 throw new ModbusConnectionException(
                     $"Could not connect to '{_ipAddress}:{_port}': {socketEx.Message}", socketEx);
             }
-            catch (ModbusTimeoutException)
-            {
-                throw;
-            }
             catch (Exception ex)
             {
+                tcpClient.Dispose();
                 throw new ModbusConnectionException($"Unexpected error while connecting: {ex.Message}", ex);
             }
         }
 
+        /// <summary>
+        /// Closes the socket and clears the connection state. Intentionally never throws:
+        /// Disconnect is invoked from error-handling paths (SendAndReceiveAsync catch blocks,
+        /// ModbusConnectionManager.Release, application shutdown), where a secondary exception
+        /// from cleanup would mask the original failure or crash a teardown sequence.
+        /// </summary>
         public void Disconnect()
         {
             try
@@ -87,9 +99,10 @@ namespace ModbusTester.Core.Core
                 _networkStream?.Close();
                 _tcpClient?.Close();
             }
-            catch (Exception ex)
+            catch
             {
-                throw new ModbusConnectionException($"Error while closing the connection: {ex.Message}", ex);
+                // Swallow deliberately — see summary above. The fields are reset in finally
+                // either way, so the client always ends up in a clean "disconnected" state.
             }
             finally
             {
@@ -151,85 +164,6 @@ namespace ModbusTester.Core.Core
             return ModbusResponseParser.ParseReadBitsResponse(response, transactionId, quantity);
         }
 
-        internal async Task<byte[]> SendAndReceiveAsync(byte[] requestBuffer, int? timeoutMsOverride = null)
-        {
-            if (!IsConnected || _networkStream == null)
-            {
-                throw new ModbusConnectionException("Cannot send request: no active connection.");
-            }
-
-            await _networkSemaphore.WaitAsync();
-
-            byte[] rentBuffer = ArrayPool<byte>.Shared.Rent(260);
-            int bytesReceivedThisTransaction = 0;
-
-            // Allows callers to request a SHORTER timeout for a specific call (e.g. a quick "probe"
-            // retry against a slave already known to be unreliable), without affecting the
-            // connection's normal IoTimeoutMs used by every other, healthy request sharing this
-            // same pooled socket.
-            int effectiveTimeoutMs = timeoutMsOverride ?? IoTimeoutMs;
-
-            try
-            {
-                using var cts = new CancellationTokenSource(effectiveTimeoutMs);
-
-                await _networkStream!.WriteAsync(requestBuffer, 0, requestBuffer.Length, cts.Token);
-
-                bytesReceivedThisTransaction += await ReadExactAsync(rentBuffer, 0, 6, cts.Token);
-
-                ushort remainingLength = (ushort)((rentBuffer[4] << 8) | rentBuffer[5]);
-
-                if (remainingLength < 2 || remainingLength > 254)
-                {
-                    Disconnect();
-                    throw new ModbusConnectionException(
-                        $"Network protocol violation: invalid packet length detected ({remainingLength} bytes). Connection closed due to lost stream synchronization.");
-                }
-
-                bytesReceivedThisTransaction += await ReadExactAsync(rentBuffer, 6, remainingLength, cts.Token);
-
-                byte[] fullResponse = new byte[6 + remainingLength];
-                Buffer.BlockCopy(rentBuffer, 0, fullResponse, 0, fullResponse.Length);
-
-                return fullResponse;
-            }
-            catch (OperationCanceledException)
-            {
-                if (bytesReceivedThisTransaction > 0)
-                {
-                    Disconnect();
-                    throw new ModbusConnectionException(
-                        $"Timeout after partially receiving {bytesReceivedThisTransaction} byte(s); connection reset to prevent stream desynchronization.");
-                }
-
-                throw new ModbusTimeoutException(
-                    $"No response received within {effectiveTimeoutMs} ms (device/slave may not be responding).");
-            }
-            catch (SocketException socketEx)
-            {
-                Disconnect();
-                throw new ModbusConnectionException($"Network I/O error: {socketEx.Message}", socketEx);
-            }
-            catch (ModbusConnectionException)
-            {
-                throw;
-            }
-            catch (ModbusProtocolException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                Disconnect();
-                throw new ModbusConnectionException($"Unexpected send/receive error: {ex.Message}", ex);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(rentBuffer);
-                _networkSemaphore.Release();
-            }
-        }
-
         // ---------------------------------------------------------
         // WRITE FUNCTIONS (FC05 / FC06 / FC16)
         // ---------------------------------------------------------
@@ -287,7 +221,14 @@ namespace ModbusTester.Core.Core
         // TRANSPORT (SEND / RECEIVE) AND HELPERS
         // ---------------------------------------------------------
 
-        internal async Task<byte[]> SendAndReceiveAsync(byte[] requestBuffer)
+        /// <summary>
+        /// The single transport funnel: every read AND write request in the client goes through
+        /// this method. timeoutMsOverride lets a caller request a SHORTER timeout for one
+        /// specific call (e.g. a quick "probe" retry against a slave already known to be
+        /// unreliable) without affecting the connection's normal IoTimeoutMs used by every
+        /// other, healthy request sharing this same pooled socket.
+        /// </summary>
+        internal async Task<byte[]> SendAndReceiveAsync(byte[] requestBuffer, int? timeoutMsOverride = null)
         {
             if (!IsConnected || _networkStream == null)
             {
@@ -297,6 +238,7 @@ namespace ModbusTester.Core.Core
             await _networkSemaphore.WaitAsync();
 
             byte[] rentBuffer = ArrayPool<byte>.Shared.Rent(260);
+            int effectiveTimeoutMs = timeoutMsOverride ?? IoTimeoutMs;
 
             // Tracks how many bytes were actually received in THIS transaction, across both the
             // header and body reads. Used to distinguish a clean "slave didn't respond at all"
@@ -307,7 +249,7 @@ namespace ModbusTester.Core.Core
 
             try
             {
-                using var cts = new CancellationTokenSource(IoTimeoutMs);
+                using var cts = new CancellationTokenSource(effectiveTimeoutMs);
 
                 await _networkStream!.WriteAsync(requestBuffer, 0, requestBuffer.Length, cts.Token);
 
@@ -346,7 +288,7 @@ namespace ModbusTester.Core.Core
                 // timeout — critical to NOT disconnect here, since in a multiplexed pool this
                 // same socket may be serving other, perfectly healthy slave IDs.
                 throw new ModbusTimeoutException(
-                    $"No response received within {IoTimeoutMs} ms (device/slave may not be responding).");
+                    $"No response received within {effectiveTimeoutMs} ms (device/slave may not be responding).");
             }
             catch (SocketException socketEx)
             {

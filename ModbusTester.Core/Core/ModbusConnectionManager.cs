@@ -1,7 +1,6 @@
 ﻿using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
-using ModbusTester.Core.Core;
 
 namespace ModbusTester.Core.Core
 {
@@ -70,20 +69,40 @@ namespace ModbusTester.Core.Core
             {
                 // Only the tab that actually created the pool entry performs the initial
                 // connect; every other tab arriving afterward reuses the same client.
+                //
+                // RACE GUARD: the connect MUST run under the entry's TransactionLock. A second
+                // tab acquiring this entry while the initial connect is still in flight sees a
+                // not-yet-connected client, fails its first read, and immediately enters
+                // TryReconnectAsync — which also calls ConnectAsync on the SAME client. Without
+                // this lock, the two ConnectAsync calls would run concurrently, and the loser's
+                // fully-connected TcpClient would be silently overwritten and leaked. The lock
+                // plus the IsConnected double-check (same discipline as TryReconnectAsync)
+                // serializes them: whichever side wins, the other observes the restored
+                // connection and returns without touching the socket.
+                await entry.TransactionLock.WaitAsync();
                 try
                 {
-                    await entry.Client.ConnectAsync();
+                    if (!entry.Client.IsConnected)
+                    {
+                        await entry.Client.ConnectAsync();
+                    }
                 }
                 catch
                 {
-                    // Roll back: this tab was the only one registered and the initial connect
-                    // failed, so the orphaned entry is removed instead of leaking in the pool.
+                    // Roll back this tab's own reference. If it was the only one registered,
+                    // the orphaned entry is removed instead of leaking in the pool; if another
+                    // tab already joined meanwhile, the entry stays and that tab's driver loop
+                    // will restore the connection through its normal reconnect path.
                     lock (_poolLock)
                     {
                         entry.RefCount--;
                         if (entry.RefCount <= 0) _pool.Remove(key);
                     }
                     throw;
+                }
+                finally
+                {
+                    entry.TransactionLock.Release();
                 }
             }
 
