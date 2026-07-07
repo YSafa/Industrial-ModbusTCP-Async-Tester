@@ -300,6 +300,11 @@ namespace ModbusTester
 
         private async void BtnWrite_Click(object? sender, EventArgs e)
         {
+            // GUARD: the Enter key in the TextBox routes here directly (TxtValue_KeyDown), which
+            // bypasses the button's Enabled state — without this check, a read-only register
+            // (FC02/FC04) could still receive a write request via Enter.
+            if (!btnWrite.Enabled) return;
+
             btnWrite.Enabled = false;
 
             try
@@ -307,23 +312,18 @@ namespace ModbusTester
                 bool isBitBased = _functionCode == ModbusFunctionCode.ReadCoils ||
                                   _functionCode == ModbusFunctionCode.ReadDiscreteInputs;
 
-                // Every manual write funnels through the SAME shared transaction lock used by the
-                // polling loop, guaranteeing this write can never interleave its bytes with a
-                // concurrent read/write from another tab sharing the same physical connection.
-                await _transactionLock.WaitAsync();
-                try
-                {
-                    if (isBitBased)
-                        await WriteCoilAsync();
-                    else if (_dataType == "Binary")
-                        await WriteBinaryAsync();
-                    else
-                        await WriteValueAsync();
-                }
-                finally
-                {
-                    _transactionLock.Release();
-                }
+                // NOTE: the shared transaction lock is NOT taken here. Each per-mode method
+                // first parses/validates the input (which may show a modal MessageBox) with NO
+                // lock held, and only wraps the actual client write call in the lock — see
+                // ExecuteLockedWriteAsync. Holding the lock across a modal dialog would freeze
+                // the polling of every tab sharing this physical connection until the user
+                // dismissed it.
+                if (isBitBased)
+                    await WriteCoilAsync();
+                else if (_dataType == "Binary")
+                    await WriteBinaryAsync();
+                else
+                    await WriteValueAsync();
             }
             catch (ModbusProtocolException ex)
             {
@@ -355,12 +355,32 @@ namespace ModbusTester
         // PER-MODE WRITE METHODS
         // ---------------------------------------------------------
 
+        /// <summary>
+        /// Wraps a single client write call in the shared transaction lock. Every manual write
+        /// funnels through the SAME lock used by the polling loops, guaranteeing its bytes can
+        /// never interleave with a concurrent read/write from another tab sharing this physical
+        /// connection. The lock scope is deliberately kept to the client call alone — parsing,
+        /// validation dialogs, and success callbacks all happen OUTSIDE it.
+        /// </summary>
+        private async System.Threading.Tasks.Task ExecuteLockedWriteAsync(Func<System.Threading.Tasks.Task> writeOperation)
+        {
+            await _transactionLock.WaitAsync();
+            try
+            {
+                await writeOperation();
+            }
+            finally
+            {
+                _transactionLock.Release();
+            }
+        }
+
         private async System.Threading.Tasks.Task WriteCoilAsync()
         {
             if (_coilCheckBox == null) return;
 
             bool value = _coilCheckBox.Checked;
-            await _client.WriteSingleCoilAsync(_slaveId, _address, value);
+            await ExecuteLockedWriteAsync(() => _client.WriteSingleCoilAsync(_slaveId, _address, value));
             HandleSuccess($"[FC05] Coil {_address} → {(value ? "1 (On)" : "0 (Off)")} written.");
         }
 
@@ -376,7 +396,7 @@ namespace ModbusTester
                     result |= (ushort)(1 << bitIndex);
             }
 
-            await _client.WriteSingleRegisterAsync(_slaveId, _address, result);
+            await ExecuteLockedWriteAsync(() => _client.WriteSingleRegisterAsync(_slaveId, _address, result));
             HandleSuccess($"[FC06] Register {_address} → 0b{Convert.ToString(result, 2).PadLeft(16, '0')} written.");
         }
 
@@ -392,7 +412,7 @@ namespace ModbusTester
                 {
                     if (!ushort.TryParse(input, out ushort val))
                     { ShowRangeError("Unsigned 16-bit", "0", "65535"); return; }
-                    await _client.WriteSingleRegisterAsync(_slaveId, _address, val);
+                    await ExecuteLockedWriteAsync(() => _client.WriteSingleRegisterAsync(_slaveId, _address, val));
                     HandleSuccess($"[FC06] Register {_address} → {val} written.");
                     break;
                 }
@@ -401,7 +421,7 @@ namespace ModbusTester
                 {
                     if (!short.TryParse(input, out short val))
                     { ShowRangeError("Signed 16-bit", "-32768", "32767"); return; }
-                    await _client.WriteSingleRegisterAsync(_slaveId, _address, unchecked((ushort)val));
+                    await ExecuteLockedWriteAsync(() => _client.WriteSingleRegisterAsync(_slaveId, _address, unchecked((ushort)val)));
                     HandleSuccess($"[FC06] Register {_address} → {val} written.");
                     break;
                 }
@@ -410,7 +430,7 @@ namespace ModbusTester
                 {
                     if (!ushort.TryParse(input, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ushort val))
                     { MessageBox.Show("Invalid hex value. Example: 1A2B", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-                    await _client.WriteSingleRegisterAsync(_slaveId, _address, val);
+                    await ExecuteLockedWriteAsync(() => _client.WriteSingleRegisterAsync(_slaveId, _address, val));
                     HandleSuccess($"[FC06] Register {_address} → 0x{val:X4} written.");
                     break;
                 }
@@ -424,7 +444,7 @@ namespace ModbusTester
                     // so writing uses the same swap.
                     bool inverse  = _dataType == "Float (32-bit)";
                     ushort[] regs = FloatToRegisters(val, inverse);
-                    await _client.WriteMultipleRegistersAsync(_slaveId, _address, regs);
+                    await ExecuteLockedWriteAsync(() => _client.WriteMultipleRegistersAsync(_slaveId, _address, regs));
                     HandleSuccess($"[FC16] Register {_address}-{_address + 1} → {val} written.");
                     break;
                 }
@@ -436,7 +456,7 @@ namespace ModbusTester
                     { ShowRangeError("Long (Int32)", "-2147483648", "2147483647"); return; }
                     bool inverse  = _dataType == "Long (32-bit)";
                     ushort[] regs = LongToRegisters(val, inverse);
-                    await _client.WriteMultipleRegistersAsync(_slaveId, _address, regs);
+                    await ExecuteLockedWriteAsync(() => _client.WriteMultipleRegistersAsync(_slaveId, _address, regs));
                     HandleSuccess($"[FC16] Register {_address}-{_address + 1} → {val} written.");
                     break;
                 }
@@ -448,7 +468,7 @@ namespace ModbusTester
                     { ShowRangeError("Double 64-bit", double.MinValue.ToString("G"), double.MaxValue.ToString("G")); return; }
                     bool inverse  = _dataType == "Double (64-bit)";
                     ushort[] regs = DoubleToRegisters(val, inverse);
-                    await _client.WriteMultipleRegistersAsync(_slaveId, _address, regs);
+                    await ExecuteLockedWriteAsync(() => _client.WriteMultipleRegistersAsync(_slaveId, _address, regs));
                     HandleSuccess($"[FC16] Register {_address}-{_address + 3} → {val} written.");
                     break;
                 }

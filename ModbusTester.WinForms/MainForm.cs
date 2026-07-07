@@ -449,19 +449,19 @@ namespace ModbusTester
             {
                 (string liveIp, int livePort) = GetIpPortSafe(session);
 
-                if (session.Connection == null || liveIp != session.CurrentIp || livePort != session.CurrentPort)
+                // REFCOUNT BALANCE: this tab may still hold a pool reference from the previous
+                // inner-loop run (e.g. it returned here after exhausting reconnect attempts, with
+                // the SAME target). AcquireAsync below increments RefCount unconditionally, so any
+                // reference already held MUST be released first — otherwise every trip through the
+                // outer loop leaks one RefCount and the shared socket can never close on Stop.
+                if (session.Connection != null)
                 {
-                    // Release any previous pooled connection this tab was registered under before
-                    // acquiring the new target — RefCount must always stay balanced 1:1 per tab.
-                    if (session.Connection != null)
-                    {
-                        ModbusConnectionManager.Release(session.CurrentIp, session.CurrentPort);
-                        session.Connection = null;
-                    }
-
-                    session.CurrentIp = liveIp;
-                    session.CurrentPort = livePort;
+                    ModbusConnectionManager.Release(session.CurrentIp, session.CurrentPort);
+                    session.Connection = null;
                 }
+
+                session.CurrentIp = liveIp;
+                session.CurrentPort = livePort;
 
                 SetPhaseSafe(session, ConnectionPhase.Searching, $"Searching for device: {session.CurrentIp}:{session.CurrentPort}...");
 
@@ -492,9 +492,16 @@ namespace ModbusTester
             {
                 PollingParameters parameters = GetPollingParametersSafe(session);
 
+                // Target change guard: IP/Port controls are locked while Connected, but there is
+                // a brief window (Searching -> Connected transition, phase update marshalled via
+                // Invoke) where the user can still edit them. If the live UI target no longer
+                // matches the connection this loop is polling, break back to the outer loop —
+                // EstablishConnectionAsync releases the old pooled connection and acquires the
+                // new target. Never keep polling a device the user has navigated away from.
                 if (parameters.Ip != session.CurrentIp || parameters.Port != session.CurrentPort)
                 {
-                    // ... (değişmedi)
+                    LogMessage(session, $"Target changed to {parameters.Ip}:{parameters.Port} — re-establishing connection.", Color.Orange);
+                    return;
                 }
 
                 // BACKOFF GUARD: if this tab is currently in a timeout backoff window, skip the
