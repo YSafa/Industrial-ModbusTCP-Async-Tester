@@ -47,12 +47,16 @@ using ModbusTester.Core.Protocol;
     ushort[]? oldValues = null;
     ushort oldStartAddress = 0;
     string lastKnownDataType = settings.GetValue<string>("DataType") ?? "Unsigned (16-bit)";
-    int lastKnownRegisterSize = GetRegisterSizeForDataType(lastKnownDataType);
     string? lastLoggedError = null;
     int lastKnownIntervalMs = settings.GetValue<int?>("PollingIntervalMs") ?? 500;
 
+    // REGISTER-CENTRIC: Quantity means "raw 16-bit registers to read from the wire", matching
+    // the WinForms application and the ModScan/Modbus Poll convention. It is NOT multiplied by
+    // the data type's register size — Quantity=10 with "Long (32-bit)" reads 10 registers and
+    // logs 5 values (any trailing registers that don't form a complete value are dropped by
+    // the change-log builders' tail guards).
     int initialQuantity = settings.GetValue<int?>("Quantity") ?? 1;
-    ushort[] readBuffer = new ushort[Math.Max(1, initialQuantity) * lastKnownRegisterSize];
+    ushort[] readBuffer = new ushort[Math.Max(1, initialQuantity)];
 
     try
     {
@@ -161,7 +165,9 @@ using ModbusTester.Core.Protocol;
                     {
                         int liveRegisterSize = GetRegisterSizeForDataType(liveDataType);
 
-                        int requiredLength = Math.Max(1, liveQuantity) * liveRegisterSize;
+                        // Register-centric: the buffer holds exactly Quantity raw registers,
+                        // regardless of the selected data type (see the note at the top).
+                        int requiredLength = Math.Max(1, liveQuantity);
                         if (readBuffer.Length != requiredLength)
                         {
                             readBuffer = new ushort[requiredLength];
@@ -196,7 +202,6 @@ using ModbusTester.Core.Protocol;
                             oldValues = (ushort[])readBuffer.Clone();
                             oldStartAddress = liveStartAddress;
                             lastKnownDataType = liveDataType;
-                            lastKnownRegisterSize = liveRegisterSize;
                         }
                         else if (cycleCounter % 100 == 0)
                         {
@@ -403,7 +408,10 @@ using ModbusTester.Core.Protocol;
     {
         var sb = new StringBuilder();
 
-        for (int i = 0; i < registers.Length; i += registerSizePerItem)
+        // Tail guard (i + size <= Length): with register-centric quantities the buffer is not
+        // guaranteed to be an exact multiple of the item size (e.g. 5 registers with Long=2);
+        // the trailing incomplete group is silently dropped — it cannot form a complete value.
+        for (int i = 0; i + registerSizePerItem <= registers.Length; i += registerSizePerItem)
         {
             ushort itemAddress = (ushort)(startAddress + i);
             string value = GetRegisterDisplayValue(registers, dataType, i, registerSizePerItem);
@@ -418,7 +426,9 @@ using ModbusTester.Core.Protocol;
         var sb = new StringBuilder();
         bool anyChanged = false;
 
-        for (int i = 0; i < newRegisters.Length; i += registerSizePerItem)
+        // Same tail guard as BuildFullChangeLog: an incomplete trailing group is skipped
+        // instead of letting AsSpan(i, size) run past the end of the buffer.
+        for (int i = 0; i + registerSizePerItem <= newRegisters.Length; i += registerSizePerItem)
         {
             // Compares raw registers block-by-block via Span, allocation-free.
             ReadOnlySpan<ushort> oldSlice = oldRegisters.AsSpan(i, registerSizePerItem);
