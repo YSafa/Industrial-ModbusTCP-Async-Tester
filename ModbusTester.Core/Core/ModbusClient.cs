@@ -33,6 +33,13 @@ namespace ModbusTester.Core.Core
         public int ConnectTimeoutMs { get; set; } = 3000;
         public int IoTimeoutMs { get; set; } = 3000;
 
+        /// <summary>
+        /// Fires once per request (isTx = true, before the bytes are written) and once per
+        /// response (isTx = false, after the response has been trimmed to its exact length).
+        /// Guarded by a null-check before invocation so an idle listener-less client pays no cost.
+        /// </summary>
+        public event Action<byte[], bool>? OnTraffic;
+
         public ModbusClient(string ipAddress, int port = 502)
         {
             _ipAddress = ipAddress;
@@ -251,6 +258,8 @@ namespace ModbusTester.Core.Core
             {
                 using var cts = new CancellationTokenSource(effectiveTimeoutMs);
 
+                if (OnTraffic != null) OnTraffic(requestBuffer, true);
+
                 await _networkStream!.WriteAsync(requestBuffer, 0, requestBuffer.Length, cts.Token);
 
                 bytesReceivedThisTransaction += await ReadExactAsync(rentBuffer, 0, 6, cts.Token);
@@ -268,6 +277,8 @@ namespace ModbusTester.Core.Core
 
                 byte[] fullResponse = new byte[6 + remainingLength];
                 Buffer.BlockCopy(rentBuffer, 0, fullResponse, 0, fullResponse.Length);
+
+                if (OnTraffic != null) OnTraffic(fullResponse, false);
 
                 return fullResponse;
             }
