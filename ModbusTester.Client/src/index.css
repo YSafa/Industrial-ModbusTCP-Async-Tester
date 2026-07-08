@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+/*
+ * Design DNA extracted from figma/src/app/App.tsx (the generated reference) and
+ * figma/src/imports/pasted_text/modbus-tcp-tester-refined.tsx (the design brief that produced
+ * it): a dense, dark industrial engineering aesthetic in the spirit of TIA Portal / TwinCAT /
+ * Modbus Poll. Named as semantic tokens here instead of the reference's inline hex literals so
+ * components read as `bg-panel` / `text-muted-foreground`, not `bg-[#1E1E24]`.
+ */
+@theme {
+  --color-background: #121212;
+  --color-panel: #1e1e24;
+  --color-panel-alt: #18181f;
+  --color-surface-hover: #25252d;
+  --color-border: #2d2d35;
+
+  --color-foreground: #f2f2f2;
+  --color-muted-foreground: #a6a6b1;
+  --color-dim-foreground: #7a7a84;
+  --color-faint-foreground: #5f5f68;
+
+  --color-accent: #3a82f7;
+  --color-success: #00d26a;
+  --color-warning: #ffb020;
+  --color-danger: #e34d4d;
+  --color-tx: #4dd0e1;
+  --color-rx: #81c784;
+
+  --color-scrollbar-track: #1a1a20;
+  --color-scrollbar-thumb: #50505a;
+  --color-scrollbar-thumb-hover: #6a6a74;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    margin: 0;
+  }
+}
+
+@layer utilities {
+  .scrollbar-industrial {
+    scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
+  }
+
+  .scrollbar-industrial::-webkit-scrollbar {
+    height: 10px;
+    width: 10px;
+  }
+
+  .scrollbar-industrial::-webkit-scrollbar-track {
+    background: var(--color-scrollbar-track);
+  }
+
+  .scrollbar-industrial::-webkit-scrollbar-thumb {
+    background: var(--color-scrollbar-thumb);
+    border-radius: 4px;
+    border: 1px solid var(--color-scrollbar-track);
+  }
+
+  .scrollbar-industrial::-webkit-scrollbar-thumb:hover {
+    background: var(--color-scrollbar-thumb-hover);
+  }
+}

@@ -4,3 +4,7 @@ obj/
 *.user
 temp*
 *.tmp
+Figma/
+node_modules/
+dist/
+*.log
