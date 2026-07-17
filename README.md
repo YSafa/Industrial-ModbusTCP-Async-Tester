@@ -2,12 +2,13 @@
 
 A from-scratch, dependency-free **Modbus TCP Master** implementation and testing suite built in **C# / .NET 10**, designed for industrial reliability rather than a quick prototype. No third-party Modbus libraries (e.g. NModbus) are used — every byte of the protocol, from MBAP header packing to IEEE 754 word-swapping, is implemented manually.
 
-The solution ships with **two independent front-ends** sharing the same core library:
+The solution ships with **three independent front-ends** sharing the same core library:
 
 - A **tabbed WinForms desktop tester** for interactive monitoring **and manual register writes**.
 - A **headless, read-only console driver** designed to run 24/7 as a Windows Service or Linux/systemd daemon, with live `appsettings.json` hot-reload. The console driver is a pure **data acquisition / polling engine** — it never writes to the device.
+- A **browser-based tester** (`ModbusTester.Web` + `ModbusTester.Client`): an ASP.NET Core/Kestrel backend that hosts multiple concurrent device sessions and pushes live phase/data/traffic updates to a React front-end over SignalR. Supports the same reads/writes as WinForms, but from any browser. Can be packaged as a single self-contained `.exe` that serves the UI itself — see [Web: Single-File Server](#web-single-file-server).
 
-Both front-ends are available as **pre-built, self-contained executables** — no .NET SDK or runtime installation required on the target machine. See [Production Deployment & Pre-built Executables](#production-deployment--pre-built-executables) below.
+WinForms and Console are available as **pre-built, self-contained executables** — no .NET SDK or runtime installation required on the target machine. See [Production Deployment & Pre-built Executables](#production-deployment--pre-built-executables) below.
 
 ---
  
@@ -34,13 +35,28 @@ ModbusTester (Solution)
 │       ├── ModbusResponseParser.cs
 │       └── ModbusTransactionManager.cs
 │
-└── ModbusTester.WinForms         → Tabbed desktop UI (read + write)
-    ├── MainForm.cs / .Designer.cs
-    ├── WriteForm.cs / .Designer.cs
-    └── Program.cs
+├── ModbusTester.WinForms         → Tabbed desktop UI (read + write)
+│   ├── MainForm.cs / .Designer.cs
+│   ├── WriteForm.cs / .Designer.cs
+│   └── Program.cs
+│
+├── ModbusTester.Web              → ASP.NET Core/Kestrel backend (read + write)
+│   ├── ModbusSessionManager.cs   → Singleton engine owning every browser session's polling loop
+│   ├── Hubs/
+│   │   ├── ModbusHub.cs              → SignalR hub — clients join a group per session
+│   │   └── ModbusHubBridgeService.cs → Bridges ModbusSessionManager events onto SignalR groups
+│   ├── Controllers/
+│   │   └── SessionsController.cs → REST endpoints: create/stop session, write coil/register
+│   └── Program.cs
+│
+└── ModbusTester.Client           → Vite + React + TypeScript front-end for ModbusTester.Web
+    └── src/
+        ├── hooks/useModbusSession.ts → SignalR subscription (phase/data/traffic per device)
+        ├── components/                → ControlPanel, DataGrid, DeviceSidebar, SystemLog, ...
+        └── lib/                        → apiClient, signalr, modbusAddressing, registerDecoder
 ```
 
-`ModbusTester.Console` and `ModbusTester.WinForms` both depend on `ModbusTester.Core`; `Core` has zero UI or console dependencies and can be reused in any .NET 10 project (including headless Linux/Raspberry Pi deployments).
+`ModbusTester.Console`, `ModbusTester.WinForms`, and `ModbusTester.Web` all depend on `ModbusTester.Core`; `Core` has zero UI or console dependencies and can be reused in any .NET 10 project (including headless Linux/Raspberry Pi deployments). `ModbusTester.Client` talks to `ModbusTester.Web` only over REST + SignalR — it has no reference to `Core`.
 
 > **Note on write support:** `ModbusTester.Core` implements the full read/write protocol surface (FC01–FC06, FC16). `ModbusTester.WinForms` exposes writes through a type-aware Write dialog (double-click any grid row). `ModbusTester.Console` is intentionally **read-only** — see [Console: 24/7 Read-Only Polling Daemon](#console-247-read-only-polling-daemon) for the rationale.
 
@@ -61,8 +77,8 @@ ModbusTester (Solution)
 - Guard clauses detect corrupted/out-of-range packet lengths and force a clean socket reset instead of risking buffer overruns.
 - Strict exception taxonomy: `ModbusProtocolException` (device-level, socket stays alive) vs. `ModbusConnectionException`/`ModbusTimeoutException` (transport-level, triggers reconnect).
 
-### Dual-Loop Driver Architecture (Console & WinForms)
-Both front-ends implement the same **Outer/Inner Loop** resilience pattern:
+### Dual-Loop Driver Architecture (Console, WinForms & Web)
+All three front-ends implement the same **Outer/Inner Loop** resilience pattern:
 - **Outer Loop** — patiently retries the initial/lost connection every 5 seconds, forever. The service never exits on a missing PLC or a dropped cable, no matter how long the outage lasts.
 - **Inner Loop** — a `PeriodicTimer`-driven polling loop that reads registers, detects data changes, and falls back to the Outer Loop only after exhausting a bounded reconnect budget (5 attempts).
 - Live IP/Port changes are validated via a **temporary-client-first** pattern: a new connection is proven successful *before* any persistent state is mutated, preventing a bad config value from permanently breaking the reconnect loop.
@@ -78,6 +94,14 @@ Both front-ends implement the same **Outer/Inner Loop** resilience pattern:
 - Two-stage graceful shutdown (`FormClosing` cancel → await background drivers → re-close) guarantees no background task touches a disposed control.
 - Double-click any grid row to open a type-aware **Write dialog** (FC05/06/16) with input masking and range validation. **This is the only place in the solution where a write request is ever issued.**
 
+### Web: Multi-Device Browser Tester (Kestrel + SignalR + React)
+- `ModbusSessionManager` is a singleton `BackgroundService` that owns every browser tab's session — each session gets its own driver loop, connection, and read buffer, so multiple devices can be polled concurrently from one backend process.
+- Per-session SignalR groups (`ModbusHub.JoinSession`/`LeaveSession`): every device's group is joined as soon as it's added in the UI and kept joined for the app's lifetime, so phase changes, data reads, and log lines for **backgrounded** devices still reach the sidebar/System Log — not just the device currently being viewed.
+- `ModbusHubBridgeService` decouples the engine from the transport: `ModbusSessionManager` raises plain C# events (`OnPhaseChanged`, `OnDataReceived`, `OnTraffic`, `OnLog`), and this hosted service is the only thing that knows about SignalR.
+- Writes (FC05/06/16) go through `SessionsController`'s REST endpoints, guarded the same way as the reads — a session must exist and hold a live connection before a write is attempted.
+- Same **phase-based control locking** as WinForms: once a session leaves `Idle`, every polling parameter except Polling Rate is locked in the UI to prevent corrupting the read buffer mid-poll.
+- Addresses are displayed with their Modicon-style prefix (e.g. `40000` for holding registers, `30000` for input registers) rather than the raw protocol offset — see `lib/modbusAddressing.ts`.
+
 ### Console: 24/7 Read-Only Polling Daemon
 `ModbusTester.Console` is purpose-built as a **headless data acquisition engine**, not a general-purpose Modbus client. It is architecturally incapable of writing to a device — `ModbusClient`'s write methods (`WriteSingleCoilAsync`, `WriteSingleRegisterAsync`, `WriteMultipleRegistersAsync`) are simply never referenced anywhere in `Program.cs`. This is a deliberate design boundary: a 24/7 unattended collector that could also mutate PLC state on a bad config value or a timing race is a much larger operational risk than a strictly read-only one.
 
@@ -90,7 +114,7 @@ Both front-ends implement the same **Outer/Inner Loop** resilience pattern:
 
 ## Production Deployment & Pre-built Executables
 
-Both front-ends are distributed as **self-contained, single-file executables** — no .NET SDK or runtime installation is required on the target machine. The distribution package follows this layout:
+WinForms and Console are distributed as **self-contained, single-file executables** — no .NET SDK or runtime installation is required on the target machine. The distribution package follows this layout:
 
 ```
 Modbus/ (Distribution Root)
@@ -127,11 +151,46 @@ Edit `appsettings.json` in the same folder at any time while the driver is runni
 
 ---
 
+## Web: Single-File Server
+
+`ModbusTester.Web` can be packaged as one self-contained `.exe` that serves the React UI itself (via `UseStaticFiles`/`MapFallbackToFile`) alongside the REST/SignalR API on `http://localhost:5080` — no separate Node process, no `npm run dev`, nothing else to start. This isn't shipped pre-built (there's no `Web/` folder in the distribution above); build it once with:
+
+```powershell
+cd ModbusTester.Web
+dotnet publish ModbusTester.Web.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ../publish
+```
+
+This runs `npm run build` for `ModbusTester.Client` automatically (see the `BuildAndPublishClient` MSBuild target in the `.csproj`) and bundles its output into the exe's `wwwroot`. Re-run this command any time the client or server source changes — the published `publish/` folder is not checked into git.
+
+Then just double-click the result:
+
+```
+publish\ModbusTester.Web.exe
+```
+
+A console window opens (for logs) and the default browser launches automatically to `http://localhost:5080`. The exe is self-contained (~100 MB) — the target machine does not need the .NET runtime installed.
+
+---
+
 ## Getting Started (Building from Source)
 
 ### Prerequisites
 - .NET 10 SDK
+- Node.js (only needed for `ModbusTester.Client`, the Web front-end)
 - A Modbus TCP slave to test against — e.g. [mbslave](https://sourceforge.net/projects/mbslave/) or [diagslave](http://www.modbusdriver.com/diagslave.html) for local testing.
+
+### Running the Web Tester
+Backend and frontend run as two separate processes in dev — start each in its own terminal:
+```bash
+cd ModbusTester.Web
+dotnet run
+```
+```bash
+cd ModbusTester.Client
+npm install   # first time only
+npm run dev
+```
+Open `http://localhost:5173` — the Vite dev server proxies API/SignalR calls to the backend on `http://localhost:5080` (CORS is already configured for this in `Program.cs`). For a single double-click-to-run executable instead, see [Web: Single-File Server](#web-single-file-server) above.
 
 ### Running the WinForms Tester
 ```bash
