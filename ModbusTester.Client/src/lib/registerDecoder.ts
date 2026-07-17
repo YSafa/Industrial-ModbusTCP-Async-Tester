@@ -2,7 +2,10 @@ import type { ModbusDataSnapshot } from "../types/modbus";
 import { toBinaryString16 } from "./binary";
 
 export interface DecodedRow {
+  /** Raw protocol address — used for selection/writes, since the backend expects raw addresses. */
   address: number;
+  /** Modicon-style address (e.g. 40000 + address for holding registers) shown to the user. */
+  displayAddress: number;
   text: string;
 }
 
@@ -37,7 +40,7 @@ function decodeItem(dataType: ModbusDataSnapshot["dataType"], words: number[]): 
 }
 
 /** Splits a flat register read into per-item rows, decoding each per the snapshot's DataType. */
-export function decodeRegisters(snapshot: ModbusDataSnapshot): DecodedRow[] {
+export function decodeRegisters(snapshot: ModbusDataSnapshot, addressBase: number): DecodedRow[] {
   const { registers, startAddress, registerSizePerItem, dataType } = snapshot;
   if (!registers || registers.length === 0) return [];
 
@@ -45,14 +48,19 @@ export function decodeRegisters(snapshot: ModbusDataSnapshot): DecodedRow[] {
   for (let i = 0; i + registerSizePerItem <= registers.length; i += registerSizePerItem) {
     rows.push({
       address: startAddress + i,
+      displayAddress: startAddress + i + addressBase,
       text: decodeItem(dataType, registers.slice(i, i + registerSizePerItem)),
     });
   }
   return rows;
 }
 
-export function decodeBits(snapshot: ModbusDataSnapshot): DecodedRow[] {
+export function decodeBits(snapshot: ModbusDataSnapshot, addressBase: number): DecodedRow[] {
   const { bits, startAddress } = snapshot;
   if (!bits) return [];
-  return bits.map((bit, i) => ({ address: startAddress + i, text: bit ? "1" : "0" }));
+  return bits.map((bit, i) => ({
+    address: startAddress + i,
+    displayAddress: startAddress + i + addressBase,
+    text: bit ? "1" : "0",
+  }));
 }

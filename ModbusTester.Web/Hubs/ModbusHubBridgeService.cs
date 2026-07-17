@@ -26,6 +26,7 @@ namespace ModbusTester.Web.Hubs
             _sessionManager.OnPhaseChanged += HandlePhaseChanged;
             _sessionManager.OnDataReceived += HandleDataReceived;
             _sessionManager.OnTraffic += HandleTraffic;
+            _sessionManager.OnLog += HandleLog;
             return Task.CompletedTask;
         }
 
@@ -34,6 +35,7 @@ namespace ModbusTester.Web.Hubs
             _sessionManager.OnPhaseChanged -= HandlePhaseChanged;
             _sessionManager.OnDataReceived -= HandleDataReceived;
             _sessionManager.OnTraffic -= HandleTraffic;
+            _sessionManager.OnLog -= HandleLog;
             return Task.CompletedTask;
         }
 
@@ -45,6 +47,9 @@ namespace ModbusTester.Web.Hubs
 
         private void HandleTraffic(string sessionId, byte[] frame, bool isTx)
             => Fire(_hubContext.Clients.Group(sessionId).SendAsync("Traffic", sessionId, frame, isTx));
+
+        private void HandleLog(string sessionId, string message)
+            => Fire(_hubContext.Clients.Group(sessionId).SendAsync("Log", sessionId, message));
 
         /// <summary>
         /// Fire-and-forget by design: the polling loop that raised the source event must never

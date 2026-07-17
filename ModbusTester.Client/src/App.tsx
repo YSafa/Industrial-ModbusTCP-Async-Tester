@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { AppHeader } from "./components/AppHeader";
 import { DeviceSidebar } from "./components/DeviceSidebar";
 import { ControlPanel } from "./components/ControlPanel";
@@ -7,10 +7,11 @@ import { SystemLog, type LogEntry, type LogLevel } from "./components/SystemLog"
 import { TrafficLogger } from "./components/TrafficLogger";
 import { useModbusSession } from "./hooks/useModbusSession";
 import { createSession, getErrorMessage, stopSession, updateParameters, writeCoil, writeRegister } from "./lib/apiClient";
+import { toDisplayAddress } from "./lib/modbusAddressing";
 import { createDefaultParameters, type DeviceEntry } from "./types/device";
-import { isBitFunctionCode, type PollingParameters } from "./types/modbus";
+import type { ConnectionPhase, PollingParameters } from "./types/modbus";
 
-function phaseToLogLevel(phase: DeviceEntry["phase"]): LogLevel {
+function phaseToLogLevel(phase: ConnectionPhase): LogLevel {
   switch (phase) {
     case "Connected":
       return "success";
@@ -24,6 +25,14 @@ function phaseToLogLevel(phase: DeviceEntry["phase"]): LogLevel {
   }
 }
 
+/** Best-effort classification of ModbusSessionManager's free-text log lines (see OnLog in ModbusSessionManager.cs). */
+function classifyBackendLog(message: string): LogLevel {
+  const lower = message.toLowerCase();
+  if (lower.includes("error") || lower.includes("could not connect") || lower.includes("exhausted")) return "error";
+  if (lower.includes("reconnect") || lower.includes("timeout") || lower.includes("attempt")) return "warning";
+  return "info";
+}
+
 function App() {
   const [devices, setDevices] = useState<DeviceEntry[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -32,25 +41,44 @@ function App() {
   const logIdRef = useRef(0);
 
   const activeDevice = devices.find((d) => d.sessionId === activeSessionId) ?? null;
-  const live = useModbusSession(activeSessionId);
+  const devicesRef = useRef<DeviceEntry[]>(devices);
+  devicesRef.current = devices;
 
   const pushLog = useCallback((level: LogLevel, message: string) => {
     logIdRef.current += 1;
     setLogEntries((prev) => [...prev.slice(-499), { id: logIdRef.current, timestamp: Date.now(), level, message }]);
   }, []);
 
-  // Mirror the live phase back onto the sidebar entry so its status dot stays in sync.
-  useEffect(() => {
-    if (!activeSessionId) return;
-    setDevices((prev) => prev.map((d) => (d.sessionId === activeSessionId ? { ...d, phase: live.phase } : d)));
-  }, [activeSessionId, live.phase]);
+  const deviceLabel = useCallback(
+    (sessionId: string) => devicesRef.current.find((d) => d.sessionId === sessionId)?.label ?? sessionId,
+    [],
+  );
 
-  useEffect(() => {
-    if (!live.statusMessage) return;
-    pushLog(phaseToLogLevel(live.phase), live.statusMessage);
-    // Only re-run when the message itself changes, not on every phase/pushLog identity change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [live.statusMessage]);
+  // Every device's phase/log events are pushed here regardless of which one is currently being
+  // viewed (see useModbusSession) — otherwise a backgrounded device's sidebar dot goes stale.
+  const handlePhaseChanged = useCallback(
+    (sessionId: string, phase: ConnectionPhase, message: string) => {
+      setDevices((prev) => prev.map((d) => (d.sessionId === sessionId ? { ...d, phase } : d)));
+      pushLog(phaseToLogLevel(phase), `[${deviceLabel(sessionId)}] ${message}`);
+    },
+    [pushLog, deviceLabel],
+  );
+
+  const handleBackendLog = useCallback(
+    (sessionId: string, message: string) => {
+      pushLog(classifyBackendLog(message), `[${deviceLabel(sessionId)}] ${message}`);
+    },
+    [pushLog, deviceLabel],
+  );
+
+  const sessionIds = useMemo(() => devices.map((d) => d.sessionId), [devices]);
+
+  const live = useModbusSession({
+    sessionIds,
+    activeSessionId,
+    onPhaseChanged: handlePhaseChanged,
+    onLog: handleBackendLog,
+  });
 
   function handleAddDevice() {
     const sessionId = crypto.randomUUID();
@@ -69,8 +97,8 @@ function App() {
     if (!activeDevice) return;
     setDevices((prev) => prev.map((d) => (d.sessionId === activeDevice.sessionId ? { ...d, parameters: next } : d)));
 
-    // IP/Port are locked in the UI while a session is running (see ControlPanel); every other
-    // field is safe to push straight through to the already-running driver loop.
+    // Every field except Polling Rate is locked in the UI while a session is running (see
+    // ControlPanel), so in practice this only ever reaches the backend for interval changes.
     if (activeDevice.phase !== "Idle") {
       updateParameters(activeDevice.sessionId, next).catch((err) =>
         pushLog("error", `Failed to update parameters: ${getErrorMessage(err)}`),
@@ -102,7 +130,7 @@ function App() {
     if (!activeDevice) return;
     try {
       await writeRegister(activeDevice.sessionId, activeDevice.parameters.slaveId, address, value);
-      pushLog("success", `Wrote ${value} to register ${address}.`);
+      pushLog("success", `Wrote ${value} to register ${toDisplayAddress(address, activeDevice.parameters.functionCode)}.`);
     } catch (err) {
       pushLog("error", `Write failed: ${getErrorMessage(err)}`);
     }
@@ -112,13 +140,11 @@ function App() {
     if (!activeDevice) return;
     try {
       await writeCoil(activeDevice.sessionId, activeDevice.parameters.slaveId, address, value);
-      pushLog("success", `Wrote ${value} to coil ${address}.`);
+      pushLog("success", `Wrote ${value} to coil ${toDisplayAddress(address, activeDevice.parameters.functionCode)}.`);
     } catch (err) {
       pushLog("error", `Write failed: ${getErrorMessage(err)}`);
     }
   }
-
-  const isBitBased = activeDevice ? isBitFunctionCode(activeDevice.parameters.functionCode) : false;
 
   return (
     <div className="relative flex h-screen w-full flex-col overflow-hidden bg-background text-foreground selection:bg-accent selection:text-white">
@@ -147,7 +173,7 @@ function App() {
               />
               <DataGrid
                 snapshot={live.snapshot}
-                isBitBased={isBitBased}
+                functionCode={activeDevice.parameters.functionCode}
                 onWriteRegister={handleWriteRegister}
                 onWriteCoil={handleWriteCoil}
               />

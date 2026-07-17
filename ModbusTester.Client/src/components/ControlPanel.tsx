@@ -2,6 +2,7 @@ import { Loader2, Play, Square } from "lucide-react";
 import { cn } from "../lib/cn";
 import { DATA_TYPES, READ_FUNCTION_CODES } from "../types/modbus";
 import type { ConnectionPhase, PollingParameters } from "../types/modbus";
+import { getAddressBase } from "../lib/modbusAddressing";
 
 interface ControlPanelProps {
   parameters: PollingParameters;
@@ -35,9 +36,24 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
   const isIdle = phase === "Idle";
   const button = PHASE_BUTTON[phase];
   const isBitBased = parameters.functionCode === "ReadCoils" || parameters.functionCode === "ReadDiscreteInputs";
+  const addressBase = getAddressBase(parameters.functionCode);
 
   function set<K extends keyof PollingParameters>(key: K, value: PollingParameters[K]) {
     onParametersChange({ ...parameters, [key]: value });
+  }
+
+  // Start Address is shown/edited as the Modicon-style prefixed address (e.g. 40000 for holding
+  // registers) but stored/sent as the raw protocol address the backend expects.
+  function setStartAddressFromDisplay(displayValue: number) {
+    const raw = Math.max(0, Math.trunc(displayValue) - addressBase);
+    set("startAddress", raw);
+  }
+
+  // Polling Rate is the one setting that stays live-editable while connected, but it must never
+  // be pushed as 0 — a zero interval would spin the backend's polling loop with no delay.
+  function setIntervalMs(value: number) {
+    const clamped = Number.isFinite(value) && value > 0 ? Math.trunc(value) : 1;
+    set("intervalMs", clamped);
   }
 
   return (
@@ -66,6 +82,7 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
         <input
           type="number"
           value={parameters.slaveId}
+          disabled={!isIdle}
           onChange={(e) => set("slaveId", Number(e.target.value))}
           className={cn(inputClass, "w-[60px]")}
         />
@@ -74,6 +91,7 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
       <RibbonField label="Function Code">
         <select
           value={parameters.functionCode}
+          disabled={!isIdle}
           onChange={(e) => set("functionCode", e.target.value as PollingParameters["functionCode"])}
           className={cn(inputClass, "w-[210px] cursor-pointer")}
         >
@@ -88,9 +106,10 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
       <RibbonField label="Start Address">
         <input
           type="number"
-          value={parameters.startAddress}
-          onChange={(e) => set("startAddress", Number(e.target.value))}
-          className={cn(inputClass, "w-[90px] font-mono")}
+          value={parameters.startAddress + addressBase}
+          disabled={!isIdle}
+          onChange={(e) => setStartAddressFromDisplay(Number(e.target.value))}
+          className={cn(inputClass, "w-[100px] font-mono")}
         />
       </RibbonField>
 
@@ -98,6 +117,7 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
         <input
           type="number"
           value={parameters.quantity}
+          disabled={!isIdle}
           onChange={(e) => set("quantity", Number(e.target.value))}
           className={cn(inputClass, "w-[70px]")}
         />
@@ -107,6 +127,7 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
         <RibbonField label="Data Type">
           <select
             value={parameters.dataType}
+            disabled={!isIdle}
             onChange={(e) => set("dataType", e.target.value as PollingParameters["dataType"])}
             className={cn(inputClass, "w-[190px] cursor-pointer")}
           >
@@ -123,8 +144,9 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
         <div className={cn(inputClass, "flex w-[70px] items-center overflow-hidden pr-1")}>
           <input
             type="number"
+            min={1}
             value={parameters.intervalMs}
-            onChange={(e) => set("intervalMs", Number(e.target.value))}
+            onChange={(e) => setIntervalMs(Number(e.target.value))}
             className="w-full min-w-0 bg-transparent text-right text-[13px] text-foreground outline-none"
           />
           <span className="flex-shrink-0 text-[11px] font-medium text-dim-foreground">ms</span>

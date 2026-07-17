@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { cn } from "../lib/cn";
 import { decodeBits, decodeRegisters, type DecodedRow } from "../lib/registerDecoder";
-import type { ModbusDataSnapshot } from "../types/modbus";
+import { getAddressBase } from "../lib/modbusAddressing";
+import { isBitFunctionCode, type ModbusDataSnapshot, type ModbusFunctionCode } from "../types/modbus";
 
 const ROWS_PER_COLUMN = 10;
 
@@ -41,8 +42,8 @@ function RegisterCell({ row, isSelected, writable, onClick, onCommit }: Register
         isSelected ? "z-10 bg-accent/5 ring-1 ring-accent" : "hover:bg-surface-hover",
       )}
     >
-      <div className="w-8 flex-shrink-0 select-none text-right font-mono text-[12px] text-dim-foreground">
-        {row.address}
+      <div className="w-12 flex-shrink-0 select-none text-right font-mono text-[12px] text-dim-foreground">
+        {row.displayAddress}
       </div>
       {editValue !== null ? (
         <input
@@ -80,7 +81,7 @@ function RegisterColumn({
   return (
     <div className="flex w-[260px] flex-shrink-0 flex-col overflow-hidden rounded border border-border bg-panel">
       <div className="flex h-[34px] items-center justify-center border-b border-border bg-surface-hover">
-        <span className="font-mono text-[12px] font-medium text-muted-foreground">{rows[0]?.address}</span>
+        <span className="font-mono text-[12px] font-medium text-muted-foreground">{rows[0]?.displayAddress}</span>
       </div>
       <div className="flex flex-col">
         {rows.map((row) => (
@@ -100,15 +101,21 @@ function RegisterColumn({
 
 interface DataGridProps {
   snapshot: ModbusDataSnapshot | null;
-  isBitBased: boolean;
+  functionCode: ModbusFunctionCode;
   onWriteRegister: (address: number, value: number) => void;
   onWriteCoil: (address: number, value: boolean) => void;
 }
 
-export function DataGrid({ snapshot, isBitBased, onWriteRegister, onWriteCoil }: DataGridProps) {
+export function DataGrid({ snapshot, functionCode, onWriteRegister, onWriteCoil }: DataGridProps) {
   const [selectedAddress, setSelectedAddress] = useState<number | null>(null);
 
-  const rows: DecodedRow[] = snapshot ? (isBitBased ? decodeBits(snapshot) : decodeRegisters(snapshot)) : [];
+  const isBitBased = isBitFunctionCode(functionCode);
+  const addressBase = getAddressBase(functionCode);
+  const rows: DecodedRow[] = snapshot
+    ? isBitBased
+      ? decodeBits(snapshot, addressBase)
+      : decodeRegisters(snapshot, addressBase)
+    : [];
   const columns = chunk(rows, ROWS_PER_COLUMN);
 
   // Multi-register decoded values (Long/Float/Double) can't be safely round-tripped from a
