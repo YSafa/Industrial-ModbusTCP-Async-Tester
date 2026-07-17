@@ -10,4 +10,25 @@
       <ProjectReference Include="..\ModbusTester.Core\ModbusTester.Core.csproj" />
     </ItemGroup>
 
+    <!--
+      Publish-only: builds ModbusTester.Client (Vite+React) and feeds its output into the publish
+      file list as wwwroot content, so the published exe can serve the SPA itself (see Program.cs's
+      UseStaticFiles/MapFallbackToFile). Hooked AfterTargets="ComputeFilesToPublish" — not
+      BeforeTargets="Publish" — because the publish file list is already frozen by the time
+      Publish itself runs; adding files any later means they'd never get copied to the output dir.
+      Left out of regular `dotnet build` so the day-to-day dev loop (`npm run dev` + `dotnet run`)
+      stays fast and untouched.
+    -->
+    <Target Name="BuildAndPublishClient" AfterTargets="ComputeFilesToPublish">
+        <Exec Command="npm install" WorkingDirectory="..\ModbusTester.Client" Condition="!Exists('..\ModbusTester.Client\node_modules')" />
+        <Exec Command="npm run build" WorkingDirectory="..\ModbusTester.Client" />
+        <ItemGroup>
+            <ClientDistFiles Include="..\ModbusTester.Client\dist\**\*.*" />
+            <ResolvedFileToPublish Include="@(ClientDistFiles->'%(FullPath)')" Exclude="@(ResolvedFileToPublish)">
+                <RelativePath>wwwroot\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+                <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+            </ResolvedFileToPublish>
+        </ItemGroup>
+    </Target>
+
 </Project>

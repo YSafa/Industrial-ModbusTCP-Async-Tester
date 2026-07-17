@@ -8,3 +8,5 @@ Figma/
 node_modules/
 dist/
 *.log
+wwwroot/
+publish/
