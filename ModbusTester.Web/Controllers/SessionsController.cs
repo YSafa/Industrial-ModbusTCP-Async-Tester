@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using ModbusTester.Core.Exceptions;
 using ModbusTester.Core.Protocol;
 
 namespace ModbusTester.Web.Controllers
@@ -160,15 +161,8 @@ namespace ModbusTester.Web.Controllers
             if (!_sessionManager.TryGetSession(sessionId, out _))
                 return NotFound();
 
-            try
-            {
-                await _sessionManager.WriteSingleCoilAsync(sessionId, request.SlaveId, request.Address, request.Value);
-                return NoContent();
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Conflict(ex.Message);
-            }
+            return await ExecuteWriteAsync(() =>
+                _sessionManager.WriteSingleCoilAsync(sessionId, request.SlaveId, request.Address, request.Value));
         }
 
         [HttpPost("{sessionId}/write/register")]
@@ -177,15 +171,8 @@ namespace ModbusTester.Web.Controllers
             if (!_sessionManager.TryGetSession(sessionId, out _))
                 return NotFound();
 
-            try
-            {
-                await _sessionManager.WriteSingleRegisterAsync(sessionId, request.SlaveId, request.Address, request.Value);
-                return NoContent();
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Conflict(ex.Message);
-            }
+            return await ExecuteWriteAsync(() =>
+                _sessionManager.WriteSingleRegisterAsync(sessionId, request.SlaveId, request.Address, request.Value));
         }
 
         [HttpPost("{sessionId}/write/registers")]
@@ -194,14 +181,37 @@ namespace ModbusTester.Web.Controllers
             if (!_sessionManager.TryGetSession(sessionId, out _))
                 return NotFound();
 
+            return await ExecuteWriteAsync(() =>
+                _sessionManager.WriteMultipleRegistersAsync(sessionId, request.SlaveId, request.StartAddress, request.Values));
+        }
+
+        /// <summary>
+        /// Runs a write command and maps every exception a live Modbus write can fail with to a
+        /// meaningful HTTP response instead of letting it fall through to an unhandled 500 — a
+        /// disconnected/non-responding slave is an expected, routine outcome here, not a server bug.
+        /// </summary>
+        private async Task<IActionResult> ExecuteWriteAsync(Func<Task> action)
+        {
             try
             {
-                await _sessionManager.WriteMultipleRegistersAsync(sessionId, request.SlaveId, request.StartAddress, request.Values);
+                await action();
                 return NoContent();
             }
             catch (InvalidOperationException ex)
             {
                 return Conflict(ex.Message);
+            }
+            catch (ModbusProtocolException ex)
+            {
+                return UnprocessableEntity($"Device rejected the write (exception code {ex.ExceptionCode}): {ex.Message}");
+            }
+            catch (ModbusTimeoutException ex)
+            {
+                return StatusCode(StatusCodes.Status504GatewayTimeout, ex.Message);
+            }
+            catch (ModbusConnectionException ex)
+            {
+                return StatusCode(StatusCodes.Status502BadGateway, ex.Message);
             }
         }
     }

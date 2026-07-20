@@ -50,9 +50,32 @@ export async function writeRegister(sessionId: string, slaveId: number, address:
   await api.post(`/api/sessions/${encodeURIComponent(sessionId)}/write/register`, { slaveId, address, value });
 }
 
+/** Recognizes ASP.NET's default ProblemDetails/ValidationProblemDetails JSON shape. */
+interface ProblemDetailsLike {
+  message?: string;
+  detail?: string;
+  title?: string;
+}
+
+/**
+ * Most endpoints return a plain-string error body (e.g. `Conflict(ex.Message)`), which axios
+ * already hands back as a string. An unhandled exception instead falls through to ASP.NET's
+ * default ProblemDetails JSON object — without this branch that object would get silently coerced
+ * to the string "[object Object]" wherever the caller interpolates it into a log/toast message.
+ */
 export function getErrorMessage(err: unknown): string {
   if (axios.isAxiosError(err)) {
-    return (err.response?.data as string | undefined) ?? err.message;
+    const data: unknown = err.response?.data;
+
+    if (typeof data === "string" && data.trim() !== "") return data;
+
+    if (data && typeof data === "object") {
+      const problem = data as ProblemDetailsLike;
+      const message = problem.message ?? problem.detail ?? problem.title;
+      if (message) return message;
+    }
+
+    return err.message;
   }
   return err instanceof Error ? err.message : String(err);
 }

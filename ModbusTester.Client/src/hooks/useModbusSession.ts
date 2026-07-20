@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ensureConnected, getHubConnection } from "../lib/signalr";
 import { base64ToHexString } from "../lib/binary";
 import type { ConnectionPhase, ModbusDataSnapshot, TrafficEntry } from "../types/modbus";
@@ -9,6 +9,8 @@ export interface ModbusHubState {
   snapshot: ModbusDataSnapshot | null;
   traffic: TrafficEntry[];
   clearTraffic: () => void;
+  /** Leaves the session's SignalR group and drops its cached snapshot (used when a device is deleted). */
+  leaveSession: (sessionId: string) => void;
 }
 
 interface UseModbusSessionOptions {
@@ -26,12 +28,15 @@ interface UseModbusSessionOptions {
  * the same id, and background devices must keep receiving PhaseChanged/Log pushes even while a
  * different device is the one being viewed (otherwise the sidebar's status dot for a backgrounded
  * device freezes/resets the next time it's reselected, since a fresh mount used to reset local
- * state to Idle before the next real event arrived). Only the currently active device's
- * snapshot/traffic are kept in this hook's own state — phase and log events are reported upward
- * via callbacks so the caller can update every device's sidebar entry and a single shared log.
+ * state to Idle before the next real event arrived). Every device's latest snapshot is cached by
+ * sessionId and kept up to date even while backgrounded, so switching the active device shows its
+ * current data immediately instead of blanking to "Waiting for data..." until the next poll tick.
+ * Traffic is still scoped to the active device only (the drawer is a live packet view, not a
+ * per-device history) — phase and log events are reported upward via callbacks so the caller can
+ * update every device's sidebar entry and a single shared log.
  */
 export function useModbusSession({ sessionIds, activeSessionId, onPhaseChanged, onLog }: UseModbusSessionOptions): ModbusHubState {
-  const [snapshot, setSnapshot] = useState<ModbusDataSnapshot | null>(null);
+  const [snapshots, setSnapshots] = useState<Record<string, ModbusDataSnapshot>>({});
   const [traffic, setTraffic] = useState<TrafficEntry[]>([]);
   const trafficIdRef = useRef(0);
 
@@ -44,10 +49,9 @@ export function useModbusSession({ sessionIds, activeSessionId, onPhaseChanged, 
   const onLogRef = useRef(onLog);
   onLogRef.current = onLog;
 
-  // The data grid/traffic drawer only ever show the active device, so swap them out on selection
-  // change; PhaseChanged/Log keep flowing for every device regardless (see the effect below).
+  // The traffic drawer only ever shows the active device's packets, so clear it on selection
+  // change; PhaseChanged/Log/data keep flowing for every device regardless (see the effect below).
   useEffect(() => {
-    setSnapshot(null);
     setTraffic([]);
   }, [activeSessionId]);
 
@@ -73,7 +77,7 @@ export function useModbusSession({ sessionIds, activeSessionId, onPhaseChanged, 
     };
 
     const onData = (id: string, data: ModbusDataSnapshot) => {
-      if (id === activeSessionIdRef.current) setSnapshot(data);
+      setSnapshots((prev) => ({ ...prev, [id]: data }));
     };
 
     const onTraffic = (id: string, frameBase64: string, isTx: boolean) => {
@@ -110,5 +114,20 @@ export function useModbusSession({ sessionIds, activeSessionId, onPhaseChanged, 
     };
   }, []);
 
-  return { snapshot, traffic, clearTraffic: () => setTraffic([]) };
+  const leaveSession = useCallback((sessionId: string) => {
+    joinedRef.current.delete(sessionId);
+    setSnapshots((prev) => {
+      if (!(sessionId in prev)) return prev;
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+    ensureConnected()
+      .then(() => getHubConnection().invoke("LeaveSession", sessionId))
+      .catch((err) => console.error("Failed to leave Modbus session group", err));
+  }, []);
+
+  const snapshot = (activeSessionId && snapshots[activeSessionId]) || null;
+
+  return { snapshot, traffic, clearTraffic: () => setTraffic([]), leaveSession };
 }

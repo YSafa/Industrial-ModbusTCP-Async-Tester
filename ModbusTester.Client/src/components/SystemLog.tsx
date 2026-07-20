@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import { cn } from "../lib/cn";
 
@@ -30,11 +30,29 @@ interface SystemLogProps {
 
 const MIN_HEIGHT = 32;
 const DEFAULT_HEIGHT = 180;
+/** How close to the bottom (px) counts as "still following the log" for auto-scroll purposes. */
+const NEAR_BOTTOM_PX = 48;
 
 export function SystemLog({ entries, isLive, onClear }: SystemLogProps) {
   const [height, setHeight] = useState(DEFAULT_HEIGHT);
   const [collapsed, setCollapsed] = useState(false);
   const dragStart = useRef<{ y: number; height: number } | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Defaults to true so the log starts pinned to the bottom; flips to false once the user scrolls
+  // up to review history, so new entries don't yank the view back down under them.
+  const isNearBottomRef = useRef(true);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+  }, []);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || collapsed) return;
+    if (isNearBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, [entries, collapsed]);
 
   const onDragMove = useCallback((e: MouseEvent) => {
     if (!dragStart.current) return;
@@ -91,7 +109,11 @@ export function SystemLog({ entries, isLive, onClear }: SystemLogProps) {
         </div>
 
         {!collapsed && (
-          <div className="scrollbar-industrial flex-1 overflow-y-auto px-[10px] py-[6px] font-mono text-[12px] leading-[1.6]">
+          <div
+            ref={scrollRef}
+            onScroll={handleScroll}
+            className="scrollbar-industrial flex-1 overflow-y-auto px-[10px] py-[6px] font-mono text-[12px] leading-[1.6]"
+          >
             {entries.map((entry) => (
               <div key={entry.id} className="flex items-start">
                 <span className="mr-3 w-[85px] shrink-0 text-faint-foreground">{formatTime(entry.timestamp)}</span>

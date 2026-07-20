@@ -93,6 +93,30 @@ function App() {
     pushLog("info", `Added ${device.label}.`);
   }
 
+  function handleDeleteDevice(sessionId: string) {
+    const device = devices.find((d) => d.sessionId === sessionId);
+    if (!device) return;
+
+    if (device.phase !== "Idle") {
+      stopSession(sessionId).catch((err) =>
+        pushLog("error", `Failed to stop session before delete: ${getErrorMessage(err)}`),
+      );
+    }
+    live.leaveSession(sessionId);
+
+    setDevices((prev) => prev.filter((d) => d.sessionId !== sessionId));
+    setActiveSessionId((prev) => {
+      if (prev !== sessionId) return prev;
+      const remaining = devices.filter((d) => d.sessionId !== sessionId);
+      return remaining[0]?.sessionId ?? null;
+    });
+    pushLog("info", `Removed ${device.label}.`);
+  }
+
+  function handleRenameDevice(sessionId: string, label: string) {
+    setDevices((prev) => prev.map((d) => (d.sessionId === sessionId ? { ...d, label } : d)));
+  }
+
   function handleParametersChange(next: PollingParameters) {
     if (!activeDevice) return;
     setDevices((prev) => prev.map((d) => (d.sessionId === activeDevice.sessionId ? { ...d, parameters: next } : d)));
@@ -159,6 +183,8 @@ function App() {
           activeSessionId={activeSessionId}
           onSelect={setActiveSessionId}
           onAdd={handleAddDevice}
+          onDelete={handleDeleteDevice}
+          onRename={handleRenameDevice}
         />
 
         <main className="z-0 flex h-full min-w-0 flex-1 flex-col">
