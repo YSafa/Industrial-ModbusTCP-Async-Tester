@@ -13,6 +13,13 @@ export interface DecodedRow {
    * blank and every interaction (select/edit/write) is disabled for it.
    */
   isPlaceholder: boolean;
+  /**
+   * Guaranteed-unique React key: `<position-in-this-read>-<address>`. Built here, once, so every
+   * consumer of a DecodedRow[] (DataGrid today, anything else tomorrow) gets collision-proof keys
+   * for free instead of each having to remember to compose one from `address` (which callers have
+   * historically reached for directly, since it reads like an id — it isn't one on its own).
+   */
+  key: string;
 }
 
 function combineBigEndian(words: number[]): DataView {
@@ -73,6 +80,7 @@ function buildAlignedRows(
       displayAddress: addr + addressBase,
       text: isPlaceholder ? "" : valueForAddress(addr),
       isPlaceholder,
+      key: `${rows.length}-${addr}`,
     });
   }
   return rows;
@@ -95,6 +103,7 @@ export function decodeRegisters(snapshot: ModbusDataSnapshot, addressBase: numbe
         displayAddress: startAddress + i + addressBase,
         text: decodeItem(dataType, registers.slice(i, i + registerSizePerItem)),
         isPlaceholder: false,
+        key: `${rows.length}-${startAddress + i}`,
       });
     }
     return rows;

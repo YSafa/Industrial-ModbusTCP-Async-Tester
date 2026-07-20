@@ -70,7 +70,8 @@ export interface ModbusDataSnapshot {
 }
 
 export interface TrafficEntry {
-  id: number;
+  /** crypto.randomUUID() — see LogEntry.id for why this isn't a plain incrementing counter. */
+  id: string;
   timestamp: number;
   isTx: boolean;
   hex: string;

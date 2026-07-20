@@ -5,7 +5,9 @@ import { cn } from "../lib/cn";
 export type LogLevel = "info" | "success" | "warning" | "error";
 
 export interface LogEntry {
-  id: number;
+  /** crypto.randomUUID() — collision-proof regardless of StrictMode/HMR double-invocation quirks
+   * that a plain incrementing ref counter can fall prey to across component re-mounts. */
+  id: string;
   timestamp: number;
   level: LogLevel;
   message: string;

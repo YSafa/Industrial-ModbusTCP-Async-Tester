@@ -38,15 +38,13 @@ function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [isTrafficDrawerOpen, setIsTrafficDrawerOpen] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
-  const logIdRef = useRef(0);
 
   const activeDevice = devices.find((d) => d.sessionId === activeSessionId) ?? null;
   const devicesRef = useRef<DeviceEntry[]>(devices);
   devicesRef.current = devices;
 
   const pushLog = useCallback((level: LogLevel, message: string) => {
-    logIdRef.current += 1;
-    setLogEntries((prev) => [...prev.slice(-499), { id: logIdRef.current, timestamp: Date.now(), level, message }]);
+    setLogEntries((prev) => [...prev.slice(-499), { id: crypto.randomUUID(), timestamp: Date.now(), level, message }]);
   }, []);
 
   const deviceLabel = useCallback(

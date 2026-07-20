@@ -38,7 +38,6 @@ interface UseModbusSessionOptions {
 export function useModbusSession({ sessionIds, activeSessionId, onPhaseChanged, onLog }: UseModbusSessionOptions): ModbusHubState {
   const [snapshots, setSnapshots] = useState<Record<string, ModbusDataSnapshot>>({});
   const [traffic, setTraffic] = useState<TrafficEntry[]>([]);
-  const trafficIdRef = useRef(0);
 
   const activeSessionIdRef = useRef(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
@@ -82,9 +81,8 @@ export function useModbusSession({ sessionIds, activeSessionId, onPhaseChanged, 
 
     const onTraffic = (id: string, frameBase64: string, isTx: boolean) => {
       if (id !== activeSessionIdRef.current) return;
-      trafficIdRef.current += 1;
       const entry: TrafficEntry = {
-        id: trafficIdRef.current,
+        id: crypto.randomUUID(),
         timestamp: Date.now(),
         isTx,
         hex: base64ToHexString(frameBase64),

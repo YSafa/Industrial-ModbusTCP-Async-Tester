@@ -93,7 +93,7 @@ function RegisterColumn({
       <div className="flex flex-col">
         {rows.map((row) => (
           <RegisterCell
-            key={row.address}
+            key={row.key}
             row={row}
             isSelected={selectedAddress === row.address}
             writable={writable}
@@ -149,7 +149,7 @@ export function DataGrid({ snapshot, functionCode, onWriteRegister, onWriteCoil 
         <div className="scrollbar-industrial flex h-full flex-col flex-wrap content-start gap-4 overflow-x-auto p-4">
           {columns.map((columnRows, i) => (
             <RegisterColumn
-              key={columnRows[0]?.address ?? i}
+              key={`col-${i}`}
               rows={columnRows}
               selectedAddress={selectedAddress}
               writable={writable}
