@@ -2,7 +2,6 @@ import { Loader2, Play, Square } from "lucide-react";
 import { cn } from "../lib/cn";
 import { DATA_TYPES, READ_FUNCTION_CODES } from "../types/modbus";
 import type { ConnectionPhase, PollingParameters } from "../types/modbus";
-import { getAddressBase } from "../lib/modbusAddressing";
 
 interface ControlPanelProps {
   parameters: PollingParameters;
@@ -36,17 +35,16 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
   const isIdle = phase === "Idle";
   const button = PHASE_BUTTON[phase];
   const isBitBased = parameters.functionCode === "ReadCoils" || parameters.functionCode === "ReadDiscreteInputs";
-  const addressBase = getAddressBase(parameters.functionCode);
 
   function set<K extends keyof PollingParameters>(key: K, value: PollingParameters[K]) {
     onParametersChange({ ...parameters, [key]: value });
   }
 
-  // Start Address is shown/edited as the Modicon-style prefixed address (e.g. 40000 for holding
-  // registers) but stored/sent as the raw protocol address the backend expects.
-  function setStartAddressFromDisplay(displayValue: number) {
-    const raw = Math.max(0, Math.trunc(displayValue) - addressBase);
-    set("startAddress", raw);
+  // Start Address is entered as the raw, 0-based protocol offset the backend expects (0, 500, ...)
+  // — the Modicon-style prefixed address (e.g. 40500) is only ever a display concern, shown in the
+  // DataGrid via toDisplayAddress/getAddressBase, not something the user types here.
+  function setStartAddress(value: number) {
+    set("startAddress", Math.max(0, Math.trunc(value)));
   }
 
   // Polling Rate is the one setting that stays live-editable while connected, but it must never
@@ -106,9 +104,10 @@ export function ControlPanel({ parameters, phase, onParametersChange, onConnect,
       <RibbonField label="Start Address">
         <input
           type="number"
-          value={parameters.startAddress + addressBase}
+          min={0}
+          value={parameters.startAddress}
           disabled={!isIdle}
-          onChange={(e) => setStartAddressFromDisplay(Number(e.target.value))}
+          onChange={(e) => setStartAddress(Number(e.target.value))}
           className={cn(inputClass, "w-[100px] font-mono")}
         />
       </RibbonField>

@@ -19,7 +19,7 @@ export function createDefaultParameters(ip = "127.0.0.1"): PollingParameters {
     startAddress: 0,
     dataType: "Unsigned (16-bit)",
     functionCode: "ReadHoldingRegisters",
-    quantity: 40,
+    quantity: 10,
     intervalMs: 500,
   };
 }

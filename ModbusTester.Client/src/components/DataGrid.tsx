@@ -23,9 +23,12 @@ interface RegisterCellProps {
 /**
  * Single click selects; double-click (when the value is a single writable 16-bit register or a
  * coil) opens inline editing — Enter/blur commits via the Write REST endpoint, Escape cancels.
+ * Placeholder rows (decade-alignment padding — see registerDecoder.buildAlignedRows) don't
+ * correspond to any address actually read, so every interaction is disabled for them.
  */
 function RegisterCell({ row, isSelected, writable, onClick, onCommit }: RegisterCellProps) {
   const [editValue, setEditValue] = useState<string | null>(null);
+  const canWrite = writable && !row.isPlaceholder;
 
   function commit() {
     if (editValue !== null && editValue.trim() !== "") onCommit(editValue.trim());
@@ -34,12 +37,16 @@ function RegisterCell({ row, isSelected, writable, onClick, onCommit }: Register
 
   return (
     <div
-      onClick={onClick}
-      onDoubleClick={() => writable && setEditValue(String(row.text))}
+      onClick={() => !row.isPlaceholder && onClick()}
+      onDoubleClick={() => canWrite && setEditValue(String(row.text))}
       className={cn(
         "flex h-[30px] items-center gap-2 border-b border-border px-2 transition-colors",
-        writable ? "cursor-pointer" : "cursor-default",
-        isSelected ? "z-10 bg-accent/5 ring-1 ring-accent" : "hover:bg-surface-hover",
+        row.isPlaceholder
+          ? "cursor-default bg-panel-alt/60 opacity-40"
+          : cn(
+              canWrite ? "cursor-pointer" : "cursor-default",
+              isSelected ? "z-10 bg-accent/5 ring-1 ring-accent" : "hover:bg-surface-hover",
+            ),
       )}
     >
       <div className="w-12 flex-shrink-0 select-none text-right font-mono text-[12px] text-dim-foreground">
