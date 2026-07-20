@@ -74,6 +74,18 @@ export function SystemLog({ entries, isLive, onClear }: SystemLogProps) {
     window.addEventListener("mouseup", onDragEnd);
   }
 
+  // Guards against a leak, not just tidiness: if this component unmounts mid-drag (e.g. the
+  // device being viewed gets deleted while the user is resizing the log panel), onDragEnd's
+  // mouseup handler never fires, so without this the window-level listeners added in onDragStart
+  // would stay attached forever — each one pinning this entire component instance's closures
+  // (and everything they reference) out of GC reach for the rest of the page's lifetime.
+  useEffect(() => {
+    return () => {
+      window.removeEventListener("mousemove", onDragMove);
+      window.removeEventListener("mouseup", onDragEnd);
+    };
+  }, [onDragMove, onDragEnd]);
+
   return (
     <>
       <div
